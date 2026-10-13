@@ -361,6 +361,28 @@ class RepologyTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_shipped_template_matches_defaults(self):
+        self.assertEqual(config.load(config.TEMPLATE), config.DEFAULTS)
+
+    def test_first_run_writes_template_once(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}, clear=False
+        ):
+            os.environ.pop("UNI_CONFIG", None)
+            created = config.ensure_user_config()
+            self.assertEqual(created, Path(tmp) / "uni" / "config.toml")
+            self.assertTrue(created.exists())
+            created.write_text("# mine\n", encoding="utf-8")
+            self.assertIsNone(config.ensure_user_config())  # never overwrites
+            self.assertEqual(created.read_text(encoding="utf-8"), "# mine\n")
+
+    def test_uni_config_env_disables_auto_write(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp, "UNI_CONFIG": "/nonexistent"}
+        ):
+            self.assertIsNone(config.ensure_user_config())
+            self.assertFalse((Path(tmp) / "uni").exists())
+
     def test_user_file_overrides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"

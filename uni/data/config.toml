@@ -1,0 +1,30 @@
+# uni configuration. Written on first run; edit freely. Missing keys use these defaults.
+
+[sources]
+# Lower priority number = preferred. "native" is your distro's own manager.
+native  = { enabled = true,  priority = 1 }
+flatpak = { enabled = true,  priority = 2 }
+snap    = { enabled = false, priority = 3 }
+# AUR and snap are off by default: they are never picked automatically.
+# Their matches still appear as hints and in `uni search`.
+aur     = { enabled = false, priority = 4, helper = "paru" }
+
+[pins]
+# Prefer one source for a specific name, e.g. discord = "flatpak"
+
+[syntax]
+mode   = "translate"   # "translate": all syntaxes go through the hierarchy
+                       # "route": listed syntaxes only use their own source
+route  = []           # e.g. ["flatpak"]
+notice = true         # show the "Understood as" line for translated commands
+
+[safety]
+snapper = true        # snapshots around transactions, only if snapper is installed
+
+[resolver]
+repology    = true    # look up per-distro names on repology.org
+cache_hours = 24
+
+[general]
+sudo = "sudo"
+log  = true           # log queries and transactions to ~/.local/state/uni

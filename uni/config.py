@@ -50,6 +50,28 @@ def default_config_path() -> Path:
     return Path(os.environ.get("UNI_CONFIG") or config_dir() / "config.toml")
 
 
+TEMPLATE = Path(__file__).parent / "data" / "config.toml"
+
+
+def ensure_user_config() -> Path | None:
+    """Write the commented default config on first run. Returns the path if it was created.
+
+    Skipped when UNI_CONFIG points elsewhere, and never overwrites an existing file.
+    """
+    if os.environ.get("UNI_CONFIG"):
+        return None
+    path = config_dir() / "config.toml"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "x", encoding="utf-8") as fh:
+            fh.write(TEMPLATE.read_text(encoding="utf-8"))
+    except FileExistsError:
+        return None
+    except OSError:
+        return None  # read-only home etc.: uni still runs on built-in defaults
+    return path
+
+
 def _deep_merge(base: dict, over: dict) -> None:
     for key, value in over.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):

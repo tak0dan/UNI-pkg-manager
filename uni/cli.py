@@ -305,6 +305,10 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     # -v belongs to uni itself; foreign syntaxes keep their own -v.
     verbose, argv = _take_flag(argv, "--verbose") if syntax != "uni" else _take_flag(argv, "-v", "--verbose")
 
+    if config_path is None:
+        created = config.ensure_user_config()
+        if created:
+            warn(f"wrote default config to {created}")
     try:
         cfg = config.load(Path(config_path) if config_path else None)
     except config.ConfigError as exc:
