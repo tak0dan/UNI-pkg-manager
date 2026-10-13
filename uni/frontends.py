@@ -83,8 +83,6 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
         terms = pos[1:]
         if syntax == "flatpak" and op == "install" and len(terms) > 1 and terms[0] in ctx.remotes():
             terms = terms[1:]  # `flatpak install flathub app`: the remote is implied by uni
-        if not terms and op != "search":
-            return passthrough
         if not terms:
             return passthrough
         return Intent(op=op, terms=terms, syntax=syntax, source=opts["source"],

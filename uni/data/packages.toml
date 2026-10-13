@@ -1,0 +1,16 @@
+# Bundled alias table. Keys are backend ids; values are the names that backend
+# uses. Users can override any term in ~/.config/uni/packages.toml.
+#
+# [relations] describes renames and forks:
+#   kind = "renamed"  same project, new name   -> resolved automatically
+#   kind = "fork"     different project         -> the user must confirm
+
+[packages.discord]
+pacman = ["discord"]
+aur = ["discord-git"]
+dnf = ["discord"]
+flatpak = ["com.discordapp.Discord"]
+
+[relations.swww]
+to = "awww"
+kind = "fork"
