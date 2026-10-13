@@ -4,6 +4,8 @@
   while installing packages. A partial upgrade breaks Arch systems.
 - snapper: when enabled and installed, take a pre/post snapshot around the
   whole transaction. If the pre-snapshot fails, the transaction does not run.
+- A step may carry fallbacks: if it fails, they run in order (used when a
+  package manager is bootstrapped via another manager, then from source).
 
 Two runners share these rules: `execute` for plain terminals (native output and
 prompts go straight to the terminal) and `arun` for the TUI (output streams into
@@ -16,6 +18,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +27,17 @@ from .backends import Step
 
 class UnsafeCommand(Exception):
     pass
+
+
+def is_root() -> bool:
+    """True when already privileged. Windows has no sudo-style escalation, so it counts as not root."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def elevate(step: Step, sudo: str) -> list[str]:
+    """The argv as it will run: with the privilege command in front when the step needs it."""
+    needs = step.root and not is_root() and sys.platform != "win32"
+    return ([sudo] if needs else []) + step.argv
 
 
 def check_safe(step: Step) -> None:
@@ -43,15 +57,20 @@ def snapper_enabled(cfg: dict) -> bool:
     return bool(cfg["safety"]["snapper"]) and shutil.which("snapper") is not None
 
 
-def _as_root(argv: list[str], root: bool, sudo: str) -> list[str]:
-    return ([sudo] if root and os.geteuid() != 0 else []) + argv
-
-
 def snapshot_argv(kind: str, desc: str, pre: str | None = None) -> list[str]:
     args = ["snapper", "create", "--type", kind, "--description", desc]
     if kind == "pre":
         return args + ["--print-number"]
     return args + ["--pre-number", pre or "<pre>"]
+
+
+def _with_sudo(argv: list[str], root: bool, sudo: str) -> list[str]:
+    return ([sudo] if root and not is_root() and sys.platform != "win32" else []) + argv
+
+
+def _attempts(step: Step) -> list[Step]:
+    """The step, then its fallbacks, in the order they should be tried."""
+    return [step, *step.fallback]
 
 
 def execute(steps: list[Step], cfg: dict, dry_run: bool, label: str, echo=print) -> int:
@@ -65,16 +84,18 @@ def execute(steps: list[Step], cfg: dict, dry_run: bool, label: str, echo=print)
 
     if dry_run:
         if use_snapper:
-            echo("$ " + " ".join(_as_root(snapshot_argv("pre", desc), True, sudo)))
+            echo("$ " + " ".join(_with_sudo(snapshot_argv("pre", desc), True, sudo)))
         for step in steps:
-            echo("$ " + " ".join(_as_root(step.argv, step.root, sudo)))
+            echo("$ " + " ".join(_with_sudo(step.argv, step.root, sudo)))
+            for fb in step.fallback:
+                echo("  or, if that fails: $ " + " ".join(_with_sudo(fb.argv, fb.root, sudo)))
         if use_snapper:
-            echo("$ " + " ".join(_as_root(snapshot_argv("post", desc, "<pre>"), True, sudo)))
+            echo("$ " + " ".join(_with_sudo(snapshot_argv("post", desc, "<pre>"), True, sudo)))
         return 0
 
     pre_num: str | None = None
     if use_snapper:
-        proc = subprocess.run(_as_root(snapshot_argv("pre", desc), True, sudo),
+        proc = subprocess.run(_with_sudo(snapshot_argv("pre", desc), True, sudo),
                               capture_output=True, text=True, check=False)
         if proc.returncode != 0 or not proc.stdout.strip().isdigit():
             echo(f"error: snapper pre-snapshot failed; not running the transaction: {proc.stderr.strip()}")
@@ -83,12 +104,15 @@ def execute(steps: list[Step], cfg: dict, dry_run: bool, label: str, echo=print)
 
     rc = 0
     for step in steps:
-        rc = subprocess.run(_as_root(step.argv, step.root, sudo), check=False).returncode
+        for attempt in _attempts(step):
+            rc = subprocess.run(_with_sudo(attempt.argv, attempt.root, sudo), check=False).returncode
+            if rc == 0:
+                break
         if rc:
             break
 
     if pre_num is not None:
-        subprocess.run(_as_root(snapshot_argv("post", desc, pre_num), True, sudo), check=False)
+        subprocess.run(_with_sudo(snapshot_argv("post", desc, pre_num), True, sudo), check=False)
     return rc
 
 
@@ -123,7 +147,7 @@ async def arun(steps: list[Step], cfg: dict, label: str, emit: Callable[[str], N
     desc = f"uni: {label}"
 
     # The snapshot runs under sudo too, so prime whenever either needs root.
-    needs_root = (any(s.root for s in steps) or snapper_enabled(cfg)) and os.geteuid() != 0
+    needs_root = (any(s.root for s in steps) or snapper_enabled(cfg)) and not is_root() and sys.platform != "win32"
     if needs_root:
         # sudo reads its password from the terminal, so cache credentials before the log view takes over.
         emit(f"$ {sudo} -v   (authenticate once for this transaction)")
@@ -133,7 +157,7 @@ async def arun(steps: list[Step], cfg: dict, label: str, emit: Callable[[str], N
 
     pre_num: str | None = None
     if snapper_enabled(cfg):
-        rc, out = await _capture(_as_root(snapshot_argv("pre", desc), True, sudo))
+        rc, out = await _capture(_with_sudo(snapshot_argv("pre", desc), True, sudo))
         if rc or not out.strip().isdigit():
             emit("error: snapper pre-snapshot failed; not running the transaction")
             return 1
@@ -142,15 +166,18 @@ async def arun(steps: list[Step], cfg: dict, label: str, emit: Callable[[str], N
 
     rc = 0
     for step in steps:
-        argv = _as_root(step.argv, step.root, sudo)
-        emit("$ " + " ".join(argv) + ("   (interactive)" if step.interactive else ""))
-        rc = suspend(argv) if step.interactive else await _stream(argv, emit)
-        if rc:
+        for attempt in _attempts(step):
+            argv = _with_sudo(attempt.argv, attempt.root, sudo)
+            emit("$ " + " ".join(argv) + ("   (interactive)" if attempt.interactive else ""))
+            rc = suspend(argv) if attempt.interactive else await _stream(argv, emit)
+            if rc == 0:
+                break
             emit(f"command exited with status {rc}")
+        if rc:
             break
 
     if pre_num is not None:
-        post_rc, _ = await _capture(_as_root(snapshot_argv("post", desc, pre_num), True, sudo))
+        post_rc, _ = await _capture(_with_sudo(snapshot_argv("post", desc, pre_num), True, sudo))
         if not post_rc:
             emit(f"snapshot {pre_num} closed")
     return rc

@@ -16,6 +16,8 @@ class Intent:
     source: str | None = None
     # Native flags with a meaning of their own (canonical names, see capabilities.py).
     flags: frozenset[str] = frozenset()
+    # --needed: skip a name when one of its candidates is already installed.
+    needed: bool = False
     accept_replacement: bool = False
     yes: bool = False
     dry_run: bool = False

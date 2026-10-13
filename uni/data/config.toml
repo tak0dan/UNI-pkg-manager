@@ -9,6 +9,9 @@ snap    = { enabled = false, priority = 3 }
 # Their matches still appear as hints and in `uni search`.
 aur     = { enabled = false, priority = 4 }   # helper: "paru" or "yay"; default: first installed
 nix     = { enabled = false, priority = 5 }
+# Windows: winget is the native manager there. choco and scoop are off unless you enable them.
+choco   = { enabled = false, priority = 6 }
+scoop   = { enabled = false, priority = 6 }
 
 [pins]
 # Prefer one source for a specific name, e.g. discord = "flatpak"

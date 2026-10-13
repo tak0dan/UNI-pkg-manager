@@ -17,6 +17,8 @@ DEFAULTS: dict = {
         "flatpak": {"enabled": True, "priority": 2},
         "snap": {"enabled": False, "priority": 3},
         "nix": {"enabled": False, "priority": 5},
+        "choco": {"enabled": False, "priority": 6},
+        "scoop": {"enabled": False, "priority": 6},
         "aur": {"enabled": False, "priority": 4},
     },
     "pins": {},

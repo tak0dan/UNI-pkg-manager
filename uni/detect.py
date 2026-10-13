@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,7 +30,24 @@ def read_os_release(path: Path = OS_RELEASE) -> dict[str, str]:
     return data
 
 
+WINDOWS_ORDER = ("winget", "choco", "scoop")
+
+
+def family_of(os_release: dict[str, str]) -> str | None:
+    """The native manager this distro uses, whether or not it is installed."""
+    if sys.platform == "win32":
+        return "winget"
+    idents = [os_release.get("ID", "")] + os_release.get("ID_LIKE", "").split()
+    for ident in idents:
+        for backend, families in FAMILY.items():
+            if ident in families or (backend == "zypper" and ident.startswith("opensuse")):
+                return backend
+    return None
+
+
 def native_backend(os_release: dict[str, str], available: set[str]) -> str | None:
+    if sys.platform == "win32":
+        return next((b for b in WINDOWS_ORDER if b in available), None)
     idents = [os_release.get("ID", "")] + os_release.get("ID_LIKE", "").split()
     for ident in idents:
         for backend, families in FAMILY.items():
@@ -54,6 +72,8 @@ class Host:
 
 def probe(available: set[str], os_release: dict[str, str] | None = None) -> Host:
     rel = read_os_release() if os_release is None else os_release
+    if sys.platform == "win32" and not rel:
+        rel = {"ID": "windows", "PRETTY_NAME": "Windows"}
     return Host(
         os_id=rel.get("ID", "unknown"),
         os_like=rel.get("ID_LIKE", ""),

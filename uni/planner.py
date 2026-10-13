@@ -14,14 +14,13 @@ taken. Executing it is a separate step (transaction.py).
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass, field
 
 from . import capabilities, frontends, resolver
 from .backends import Step
 from .model import Candidate, Intent
 from .resolver import Resolution
-from .transaction import snapper_enabled
+from .transaction import elevate, snapper_enabled
 
 EXIT_REFUSED = 4
 
@@ -46,13 +45,13 @@ class Draft:
         return not self.failures
 
     def ties(self) -> list[int]:
-        return [i for i, r in enumerate(self.resolutions) if r.tie]
+        return [i for i, r in enumerate(self.resolutions) if r.tie and r.skipped is None]
 
     def forks(self) -> list[int]:
         """Replacements (fork relations) the user has not accepted yet."""
         if self.intent.accept_replacement:
             return []
-        return [i for i, r in enumerate(self.resolutions) if r.replacement]
+        return [i for i, r in enumerate(self.resolutions) if r.replacement and r.skipped is None]
 
 
 @dataclass
@@ -64,6 +63,7 @@ class Plan:
     flags: frozenset[str]
     notices: list[str]
     snapshot: bool
+    skipped: list[tuple[str, Candidate]] = field(default_factory=list)  # --needed: already installed
 
     @property
     def label(self) -> str:
@@ -76,15 +76,17 @@ class Plan:
         """Human-readable plan, as the interface and plain mode show it."""
         lines = ["Plan"]
         lines += [f"  {c.source:<8} {c.ref} {c.version}".rstrip() for _, c in self.items]
+        for term, cand in self.skipped:
+            lines.append(f"  already installed, skipped: {cand.source} {cand.ref} ({term})")
         if self.flags:
             names = ", ".join(sorted(self.flags))
             lines.append(f"  native flags: {names}")
-        lines += ["", "Commands"]
-        if self.snapshot:
-            lines.append("  snapshot before and after (snapper)")
-        for step in self.steps:
-            argv = ([sudo] if step.root and os.geteuid() != 0 else []) + step.argv
-            lines.append("  $ " + " ".join(argv))
+        if self.steps:
+            lines += ["", "Commands"]
+            if self.snapshot:
+                lines.append("  snapshot before and after (snapper)")
+            for step in self.steps:
+                lines.append("  $ " + " ".join(elevate(step, sudo)))
         if self.notices:
             lines += [""] + self.notices
         return lines
@@ -97,6 +99,7 @@ class Plan:
             "flags": sorted(self.flags),
             "commands": self.commands(),
             "snapshot": self.snapshot,
+            "skipped": [{"term": t, **asdict(c)} for t, c in self.skipped],
         }
 
 
@@ -113,10 +116,21 @@ def draft(intent: Intent, ctx: resolver.Context) -> Draft:
     failures: list[tuple[int, str]] = []
     for term in intent.terms:
         res = resolver.resolve(term, ctx, intent.source, installed_only=remove)
+        if res.error is None and intent.op == "install" and intent.needed:
+            # --needed: a term whose candidate is already installed needs no action.
+            for cand in res.ranked:
+                if ctx.backends[cand.source].installed(cand.ref):
+                    res.skipped = cand
+                    break
         resolutions.append(res)
         if res.error:
             failures.append((res.code or 1, res.error))
     return Draft(intent, resolutions, failures)
+
+
+def default_choice(res: Resolution) -> Candidate:
+    """What a term resolves to without asking: the installed match with --needed, else the best."""
+    return res.skipped if res.skipped is not None else res.best
 
 
 def _understood_as(ctx: resolver.Context, intent: Intent, term: str, cand: Candidate) -> str:
@@ -137,8 +151,11 @@ def finalize(d: Draft, chosen: list[Candidate], ctx: resolver.Context, cfg: dict
     if len(chosen) != len(intent.terms):
         raise PlanError("internal: one candidate is needed per requested name", code=1)
 
+    skipped = [(res.term, cand) for res, cand in zip(d.resolutions, chosen) if res.skipped is not None]
+    items = [(term, cand) for term, cand, res in zip(intent.terms, chosen, d.resolutions) if res.skipped is None]
+
     unique: dict[tuple[str, str], Candidate] = {}
-    for cand in chosen:
+    for _, cand in items:
         unique.setdefault((cand.source, cand.ref), cand)
     cands = list(unique.values())
 
@@ -166,18 +183,19 @@ def finalize(d: Draft, chosen: list[Candidate], ctx: resolver.Context, cfg: dict
     notices: list[str] = []
     implied = frontends.FRONTENDS[intent.syntax].backend
     if intent.syntax != "uni" and intent.source is None and cfg["syntax"]["notice"]:
-        for term, cand in zip(intent.terms, chosen):
+        for term, cand in items:
             if cand.source != implied:
                 notices.append(_understood_as(ctx, intent, term, cand))
 
     return Plan(
         op=intent.op,
         syntax=intent.syntax,
-        items=list(zip(intent.terms, chosen)),
+        items=items,
         steps=steps,
         flags=intent.flags,
         notices=notices,
-        snapshot=snapper_enabled(cfg),
+        snapshot=snapper_enabled(cfg) and bool(steps),
+        skipped=skipped,
     )
 
 

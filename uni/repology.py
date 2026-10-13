@@ -34,6 +34,10 @@ def repo_to_backend(repo: str) -> str | None:
         return "flatpak"
     if repo == "snap":
         return "snap"
+    if repo == "winget":
+        return "winget"
+    if repo == "chocolatey":
+        return "choco"
     return None
 
 

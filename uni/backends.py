@@ -12,11 +12,12 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .model import Candidate
 
@@ -45,6 +46,9 @@ class Step:
     root: bool = False
     label: str = ""
     interactive: bool = False
+    # Tried in order if this step fails (for example: install a manager via another manager,
+    # and fall back to its official source installer).
+    fallback: list["Step"] = field(default_factory=list)
 
 
 # Set by the CLI so every query is traced (argv, exit code, duration).
@@ -86,6 +90,7 @@ class Backend:
     binary = ""
     native = False  # True for the distro's own manager
     needs_root = False
+    platforms: tuple[str, ...] = ("linux",)  # sys.platform values this backend runs on
     # Native remove flags this backend can express (canonical names, see capabilities.py).
     remove_flags: frozenset[str] = frozenset()
 
@@ -93,7 +98,7 @@ class Backend:
         self.options = options or {}
 
     def available(self) -> bool:
-        return shutil.which(self.binary) is not None
+        return sys.platform in self.platforms and shutil.which(self.binary) is not None
 
     def query(self, name: str) -> list[Candidate]:
         """Exact-name lookup. Used for live verification of resolved names."""
@@ -459,10 +464,146 @@ class NixBackend(Backend):
         return [Step(["nix", *NIX_FLAGS, "profile", "remove", c.ref]) for c in cands]
 
 
+def _parse_winget_table(out: str) -> list[dict]:
+    """winget prints a fixed-width table. Columns are located from the header line."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    header_at = next((i for i, line in enumerate(lines) if line.lstrip().startswith("Name") and " Id" in line), None)
+    if header_at is None:
+        return []
+    header = lines[header_at]
+    cols = {name: header.find(name) for name in ("Name", "Id", "Version", "Match", "Source")}
+    present = sorted((pos, name) for name, pos in cols.items() if pos >= 0)
+    rows = []
+    for line in lines[header_at + 2:]:  # skip the dashes line
+        if set(line.strip()) <= {"-"}:
+            continue
+        row = {}
+        for idx, (pos, name) in enumerate(present):
+            end = present[idx + 1][0] if idx + 1 < len(present) else len(line)
+            row[name] = line[pos:end].strip()
+        if row.get("Id"):
+            rows.append(row)
+    return rows
+
+
+class WingetBackend(Backend):
+    """Windows Package Manager. Packages are addressed by their Id, e.g. Discord.Discord."""
+
+    id = "winget"
+    binary = "winget"
+    native = True
+    needs_root = False
+    platforms = ("win32",)
+
+    def _rows(self, term: str) -> list[dict]:
+        _, out = run(["winget", "search", term, "--accept-source-agreements"])
+        return _parse_winget_table(out)
+
+    def query(self, name):
+        found = []
+        for row in self._rows(name):
+            if name.lower() in (row.get("Id", "").lower(), row.get("Name", "").lower()):
+                found.append(Candidate(self.id, row["Id"], row.get("Version", ""), row.get("Name", "")))
+        return found
+
+    def search(self, term):
+        return [Candidate(self.id, r["Id"], r.get("Version", ""), r.get("Name", "")) for r in self._rows(term)]
+
+    def installed(self, ref):
+        rc, out = run(["winget", "list", "--id", ref, "--exact", "--accept-source-agreements"])
+        return rc == 0 and ref.lower() in out.lower()
+
+    def install(self, cands, yes):
+        steps = []
+        for c in cands:
+            steps.append(Step(["winget", "install", "--id", c.ref, "--exact", "--silent",
+                               "--accept-package-agreements", "--accept-source-agreements"]))
+        return steps
+
+    def remove(self, cands, yes, flags=frozenset()):
+        return [Step(["winget", "uninstall", "--id", c.ref, "--exact", "--silent"]) for c in cands]
+
+
+def _parse_choco_limit_output(out: str) -> list[tuple[str, str]]:
+    """`choco ... --limit-output` prints name|version lines."""
+    rows = []
+    for line in out.splitlines():
+        name, sep, version = line.partition("|")
+        if sep and name.strip():
+            rows.append((name.strip(), version.strip()))
+    return rows
+
+
+class ChocoBackend(Backend):
+    id = "choco"
+    binary = "choco"
+    native = True
+    needs_root = False
+    platforms = ("win32",)
+
+    def query(self, name):
+        _, out = run(["choco", "search", name, "--exact", "--limit-output"])
+        return [Candidate(self.id, n, v) for n, v in _parse_choco_limit_output(out) if n.lower() == name.lower()]
+
+    def search(self, term):
+        _, out = run(["choco", "search", term, "--limit-output"])
+        return [Candidate(self.id, n, v) for n, v in _parse_choco_limit_output(out)]
+
+    def installed(self, ref):
+        _, out = run(["choco", "list", "--local-only", "--exact", "--limit-output", ref])
+        return any(n.lower() == ref.lower() for n, _ in _parse_choco_limit_output(out))
+
+    def install(self, cands, yes):
+        return [Step(["choco", "install", c.ref, "-y"]) for c in cands]
+
+    def remove(self, cands, yes, flags=frozenset()):
+        return [Step(["choco", "uninstall", c.ref, "-y"]) for c in cands]
+
+
+class ScoopBackend(Backend):
+    id = "scoop"
+    binary = "scoop"
+    native = False
+    needs_root = False
+    platforms = ("win32",)
+
+    def _rows(self, term: str) -> list[Candidate]:
+        _, out = run(["scoop", "search", term])
+        results = []
+        header_seen = False
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if not header_seen:
+                header_seen = parts[0] == "Name"
+                continue
+            if set(parts[0]) <= {"-"}:
+                continue
+            results.append(Candidate(self.id, parts[0], parts[1] if len(parts) > 1 else ""))
+        return results
+
+    def query(self, name):
+        return [c for c in self._rows(name) if c.ref.lower() == name.lower()]
+
+    def search(self, term):
+        return self._rows(term)
+
+    def installed(self, ref):
+        rc, out = run(["scoop", "list", ref])
+        return rc == 0 and any(line.split()[:1] == [ref] for line in out.splitlines())
+
+    def install(self, cands, yes):
+        return [Step(["scoop", "install", c.ref]) for c in cands]
+
+    def remove(self, cands, yes, flags=frozenset()):
+        return [Step(["scoop", "uninstall", c.ref]) for c in cands]
+
+
 REGISTRY: dict[str, type[Backend]] = {
     cls.id: cls
     for cls in (PacmanBackend, AptBackend, DnfBackend, ZypperBackend, FlatpakBackend, SnapBackend,
-                NixBackend, AurBackend, ParuBackend, YayBackend)
+                NixBackend, AurBackend, ParuBackend, YayBackend, WingetBackend, ChocoBackend, ScoopBackend)
 }
 
 

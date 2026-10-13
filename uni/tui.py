@@ -170,7 +170,7 @@ def _app_classes():
                                 "Use it instead?")
                     if not await self.push_screen_wait(ConfirmScreen(question)):
                         return self._finish(4, "refused: replacement not confirmed")
-                if res.tie:
+                if res.tie and res.skipped is None:
                     options = [(c, planner.preview(d, c, ctx)) for c in res.ranked]
                     picked = await self.push_screen_wait(PickScreen(res.term, [c for c, _ in options],
                                                                     [cmd for _, cmd in options]))
@@ -178,7 +178,7 @@ def _app_classes():
                         return self._finish(1, f"cancelled: '{res.term}' not chosen")
                     chosen.append(picked)
                 else:
-                    chosen.append(res.best)
+                    chosen.append(planner.default_choice(res))
 
             try:
                 plan = planner.finalize(d, chosen, ctx, cfg, assume_yes=True)
@@ -188,6 +188,8 @@ def _app_classes():
                 return self._finish(exc.code, "not run: the plan is invalid; nothing was changed")
 
             sudo = cfg["general"]["sudo"]
+            if not plan.steps:
+                return self._finish(0, "nothing to do: every requested package is already installed", plan)
             if not await self.push_screen_wait(PlanScreen(plan.render(sudo) + ["", "[b]Enter[/b] run   [b]Esc[/b] cancel"])):
                 return self._finish(1, "cancelled before running anything")
 

@@ -17,7 +17,8 @@ from .model import Intent, Invalid, Passthrough
 ParseResult = Intent | Passthrough | Invalid
 
 # Every source that can be named with --<source> as shorthand for --from <source>.
-SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur", "paru", "yay", "nix")
+SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur", "paru", "yay", "nix",
+                "winget", "choco", "scoop")
 
 
 @dataclass
@@ -120,7 +121,8 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=(), native_fl
         return Intent(op=op, terms=terms, syntax=syntax, source=opts["source"],
                       accept_replacement=opts["accept"], yes=opts["yes"],
                       dry_run=opts["dry_run"], json_out=opts["json"],
-                      flags=frozenset(verb_flags | opts["flags"]))
+                      flags=frozenset(verb_flags | (opts["flags"] - {"needed"})),
+                      needed="needed" in opts["flags"])
 
     return parse
 
@@ -150,7 +152,8 @@ def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
     if not args or not args[0].startswith("-") or args[0].startswith("--") or len(args[0]) < 2:
         return _passthrough("pacman", args)
     letter, mods = args[0][1], set(args[0][2:])
-    rest, opts, unknown = _scan(args[1:], ctx, {"--noconfirm"}, set(), ignored={"--needed"})
+    rest, opts, unknown = _scan(args[1:], ctx, {"--noconfirm"}, set(), ignored=set(),
+                                native_flags={"--needed": "needed"})
     if opts["error"]:
         return Invalid(opts["error"])
     read_only = letter in "QTVH" or (letter == "S" and mods and mods <= {"s", "i"})
@@ -173,7 +176,8 @@ def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
         return _passthrough("pacman", args, read_only=read_only)
     return Intent(op=op, terms=rest, syntax="pacman", source=opts["source"],
                   accept_replacement=opts["accept"], yes=opts["yes"] or "--noconfirm" in args,
-                  dry_run=opts["dry_run"], json_out=opts["json"], flags=frozenset(flags))
+                  dry_run=opts["dry_run"], json_out=opts["json"], flags=frozenset(flags - {"needed"}),
+                  needed="needed" in opts["flags"])
 
 
 def _pacman_remove_flags(letters: str) -> set[str]:
@@ -208,6 +212,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="same as --from: translate the command to this source")
     parser.add_argument("-y", "--yes", action="store_true", default=sup,
                         help="never prompt; ties and replacements fail instead of asking")
+    parser.add_argument("--needed", action="store_true", default=sup,
+                        help="install: skip packages already installed")
     parser.add_argument("--accept-replacement", action="store_true", default=sup,
                         help="allow a fork/replacement package (e.g. swww -> awww)")
     parser.add_argument("--dry-run", action="store_true", default=sup,
@@ -229,6 +235,9 @@ def _uni_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(op, parents=[common], aliases=["uninstall"] if op == "remove" else [])
         sp.add_argument("terms", nargs="+", metavar="PACKAGE")
     sub.add_parser("detect", parents=[common], help="show the detected host and sources")
+    boot = sub.add_parser("bootstrap", parents=[common],
+                          help="install a missing package manager (winget, choco or scoop)")
+    boot.add_argument("target", nargs="?", default=None, metavar="MANAGER")
     log = sub.add_parser("log", help="show recent uni activity")
     log.add_argument("-n", type=int, default=30, help="number of entries (default 30)")
     return parser
@@ -238,11 +247,13 @@ def _parse_uni(args: list[str], ctx: ParseCtx) -> ParseResult:
     ns = _uni_parser().parse_args(args)
     # `log` and `detect` have fewer options; getattr keeps the Intent defaults for those.
     op = "remove" if ns.op == "uninstall" else ns.op
-    return Intent(op=op, terms=getattr(ns, "terms", []), syntax="uni",
+    terms = ([ns.target] if ns.target else []) if ns.op == "bootstrap" else getattr(ns, "terms", [])
+    return Intent(op=op, terms=terms, syntax="uni",
                   source=getattr(ns, "source", None),
                   accept_replacement=getattr(ns, "accept_replacement", False),
                   yes=getattr(ns, "yes", False), dry_run=getattr(ns, "dry_run", False),
-                  json_out=getattr(ns, "json_out", False), count=getattr(ns, "n", 30))
+                  json_out=getattr(ns, "json_out", False), count=getattr(ns, "n", 30),
+                  needed=getattr(ns, "needed", False))
 
 
 FRONTENDS: dict[str, Frontend] = {
@@ -268,6 +279,24 @@ FRONTENDS: dict[str, Frontend] = {
          "search": ("search", frozenset()), "se": ("search", frozenset())},
         yes_flags={"-n", "--non-interactive", "--no-confirm"}, dry_flags=set(),
         read_only=_READ_ONLY["zypper"], ignored={"-q", "--quiet"})),
+    "winget": Frontend("winget", "winget", _generic(
+        "winget",
+        {"install": ("install", frozenset()), "uninstall": ("remove", frozenset()),
+         "remove": ("remove", frozenset()), "search": ("search", frozenset())},
+        yes_flags={"--silent", "--disable-interactivity", "-h"}, dry_flags=set(),
+        read_only={"search", "list", "show"},
+        ignored={"--exact", "--accept-package-agreements", "--accept-source-agreements"})),
+    "choco": Frontend("choco", "choco", _generic(
+        "choco",
+        {"install": ("install", frozenset()), "uninstall": ("remove", frozenset()),
+         "search": ("search", frozenset())},
+        yes_flags={"-y", "--yes"}, dry_flags=set(), read_only={"search", "list"},
+        ignored={"--limit-output"})),
+    "scoop": Frontend("scoop", "scoop", _generic(
+        "scoop",
+        {"install": ("install", frozenset()), "uninstall": ("remove", frozenset()),
+         "remove": ("remove", frozenset()), "search": ("search", frozenset())},
+        yes_flags=set(), dry_flags=set(), read_only={"search", "list", "info", "status"})),
     "flatpak": Frontend("flatpak", "flatpak", _generic(
         "flatpak",
         {"install": ("install", frozenset()), "uninstall": ("remove", frozenset()),

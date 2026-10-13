@@ -56,6 +56,7 @@ class Resolution:
     replacement: str | None = None  # set when the request is a fork of another project
     notes: list[str] = field(default_factory=list)
     hints: list[Candidate] = field(default_factory=list)  # matches in disabled sources
+    skipped: Candidate | None = None  # --needed: the installed candidate that satisfies the term
     error: str | None = None
     code: int = 0
 
