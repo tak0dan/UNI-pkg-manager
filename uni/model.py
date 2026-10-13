@@ -29,6 +29,14 @@ class Passthrough:
     argv: list[str]
     syntax: str
     read_only: bool = False
+    dry_run: bool = False
+
+
+@dataclass
+class Invalid:
+    """The command line cannot be understood; nothing should run."""
+
+    message: str
 
 
 @dataclass(frozen=True)

@@ -11,9 +11,9 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .model import Intent, Passthrough
+from .model import Intent, Invalid, Passthrough
 
-ParseResult = Intent | Passthrough
+ParseResult = Intent | Passthrough | Invalid
 
 # Every source that can be named with --<source> as shorthand for --from <source>.
 SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur")
@@ -44,17 +44,34 @@ def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
     still passes through.
     """
     pos: list[str] = []
-    opts = {"source": None, "yes": False, "dry_run": False, "json": False, "accept": False}
+    opts = {"source": None, "yes": False, "dry_run": False, "json": False, "accept": False, "error": None}
     unknown: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--from" and _is_uni_flag_value(args, i, ctx):
-            opts["source"] = args[i + 1]
-            i += 2
+        if a == "--from" and not _is_uni_flag_value(args, i, ctx):
+            unknown.append(a)  # flatpak's own --from FILE: the native manager keeps it
+            i += 1
             continue
-        if a.startswith("--from=") and a.partition("=")[2] in ctx.known_sources:
-            opts["source"] = a.partition("=")[2]
+        if a in ("--from", "--with"):
+            if _is_uni_flag_value(args, i, ctx):
+                opts["source"] = args[i + 1]
+                i += 2
+                continue
+            known = ", ".join(sorted(ctx.known_sources))
+            if i + 1 < len(args):
+                opts["error"] = f"unknown source '{args[i + 1]}'; one of {known}"
+                i += 2
+            else:
+                opts["error"] = f"{a} needs a source; one of {known}"
+                i += 1
+            continue
+        if a.startswith(("--from=", "--with=")):
+            value = a.partition("=")[2]
+            if value in ctx.known_sources:
+                opts["source"] = value
+            else:
+                opts["error"] = f"unknown source '{value}'; one of {', '.join(sorted(ctx.known_sources))}"
         elif a.startswith("--") and a[2:] in SOURCE_FLAGS and a[2:] in ctx.known_sources:
             opts["source"] = a[2:]  # --flatpak is shorthand for --from flatpak
         elif a in yes_flags:
@@ -80,8 +97,9 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
 
     def parse(args: list[str], ctx: ParseCtx) -> ParseResult:
         pos, opts, unknown = _scan(args, ctx, yes_flags, dry_flags, ignored)
-        passthrough = Passthrough(backend=syntax, argv=[syntax, *args], syntax=syntax,
-                                  read_only=bool(pos) and pos[0] in read_only)
+        if opts["error"]:
+            return Invalid(opts["error"])
+        passthrough = _passthrough(syntax, args, read_only=bool(pos) and pos[0] in read_only)
         if unknown or not pos or pos[0] not in ops:
             return passthrough
         op = ops[pos[0]]
@@ -97,13 +115,22 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
     return parse
 
 
+def _passthrough(syntax: str, args: list[str], read_only: bool = False) -> Passthrough:
+    """Hand the command to the native manager. --dry-run is honoured here, not forwarded."""
+    dry = "--dry-run" in args
+    kept = [a for a in args if a != "--dry-run"]
+    return Passthrough(backend=syntax, argv=[syntax, *kept], syntax=syntax, read_only=read_only, dry_run=dry)
+
+
 def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
     """pacman's ops are single letters with modifiers: -S, -Ss, -R, -Syu, -Qdt ..."""
-    passthrough = Passthrough(backend="pacman", argv=["pacman", *args], syntax="pacman")
     if not args or not args[0].startswith("-") or args[0].startswith("--") or len(args[0]) < 2:
-        return passthrough
+        return _passthrough("pacman", args)
     letter, mods = args[0][1], set(args[0][2:])
     rest, opts, unknown = _scan(args[1:], ctx, {"--noconfirm"}, set(), ignored={"--needed"})
+    if opts["error"]:
+        return Invalid(opts["error"])
+    passthrough = _passthrough("pacman", args)
     if unknown:
         return passthrough
     read_only = letter in "QTVH" or (letter == "S" and mods and mods <= {"s", "i"})
@@ -144,6 +171,8 @@ def _uni_parser() -> argparse.ArgumentParser:
                         help="never prompt; ties and replacements fail instead of asking")
     common.add_argument("--accept-replacement", action="store_true",
                         help="allow a fork/replacement package (e.g. swww -> awww)")
+    common.add_argument("--with", dest="source", metavar="SOURCE",
+                        help="same as --from: translate the command to this source")
     common.add_argument("--dry-run", action="store_true", help="print the native commands only")
     common.add_argument("--json", dest="json_out", action="store_true",
                         help="JSON output (search, detect, --dry-run)")

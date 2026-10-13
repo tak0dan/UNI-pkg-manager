@@ -10,7 +10,7 @@ from pathlib import Path
 from . import backends, config, detect, frontends, resolver
 from .backends import Step
 from .frontends import ParseCtx
-from .model import Candidate, Intent, Passthrough
+from .model import Candidate, Intent, Invalid, Passthrough
 from .render import (emit_json, format_entry, make_trace, read_log, record, search_table, warn,
                      write_transaction)
 from .repology import Repology
@@ -145,7 +145,7 @@ def _run_passthrough(p: Passthrough, ctx: resolver.Context, cfg: dict) -> int:
     if p.read_only:  # queries change nothing, so no snapshot is taken
         run_cfg = {**cfg, "safety": {**cfg["safety"], "snapper": False}}
     try:
-        rc = execute([step], run_cfg, dry_run=False, label=" ".join(p.argv))
+        rc = execute([step], run_cfg, dry_run=p.dry_run, label=" ".join(p.argv))
     except UnsafeCommand as exc:
         warn(str(exc))
         return EXIT_REFUSED
@@ -325,6 +325,9 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     known = frozenset(cfg["sources"]) | frozenset(ctx.backends) | frozenset(frontends.SOURCE_FLAGS)
     parsed = frontends.parse(syntax, argv, ParseCtx(known_sources=known, remotes=_flatpak_remotes))
 
+    if isinstance(parsed, Invalid):
+        warn(parsed.message)
+        return EXIT_ERROR
     if isinstance(parsed, Passthrough):
         return _run_passthrough(parsed, ctx, cfg)
 

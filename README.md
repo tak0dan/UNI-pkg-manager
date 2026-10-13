@@ -68,6 +68,8 @@ uni log                 [-n COUNT]
   `--as SYNTAX` forces one; a symlink named `uni-<syntax>` does the same.
 - Sources: `--flatpak`, `--aur`, `--snap`, `--pacman`, `--apt`, `--dnf`, `--zypper`, `--native`
   are shorthand for `--from <source>`. `--from` is exclusive: nothing falls back.
+- `--with <source>` (or `--with=<source>`) is the same as `--from`, and reads well after a
+  native command: `uni -S steam --with flatpak` installs Steam from Flatpak.
 - Install and remove open the interface in a terminal. Enter confirms, Esc cancels, `q` closes
   when the run has finished. Native commands run non-interactively after you confirm, except
   the AUR helper, which runs in the terminal so you can review PKGBUILDs. sudo asks for the

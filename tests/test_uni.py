@@ -13,7 +13,7 @@ from unittest import mock
 
 from uni import backends, config, detect, frontends, repology, resolver
 from uni.backends import Backend, Step
-from uni.model import Candidate, Intent, Passthrough
+from uni.model import Candidate, Intent, Invalid, Passthrough
 from uni.resolver import Resolution
 from uni.transaction import UnsafeCommand, check_safe, execute
 
@@ -524,6 +524,25 @@ class LoggingTests(unittest.TestCase):
     def test_log_subcommand_parses(self):
         p = frontends.parse("uni", ["log", "-n", "5"], PARSE_CTX)
         self.assertEqual((p.op, p.count), ("log", 5))
+
+
+class WithFlagTests(unittest.TestCase):
+    def test_with_is_same_as_from_on_every_syntax(self):
+        p = parse("pacman", "-S", "steam", "--with", "flatpak")
+        self.assertIsInstance(p, Intent)
+        self.assertEqual((p.op, p.terms, p.source), ("install", ["steam"], "flatpak"))
+        p = parse("apt", "install", "--with=snap", "x")
+        self.assertEqual(p.source, "snap")
+
+    def test_with_bad_or_missing_source_is_invalid(self):
+        self.assertIsInstance(parse("pacman", "-S", "steam", "--with", "bogus"), Invalid)
+        self.assertIsInstance(parse("pacman", "-S", "steam", "--with"), Invalid)
+
+    def test_dry_run_on_passthrough_is_not_forwarded(self):
+        p = parse("pacman", "-Syu", "--dry-run")
+        self.assertIsInstance(p, Passthrough)
+        self.assertTrue(p.dry_run)
+        self.assertNotIn("--dry-run", p.argv)
 
 
 class CliGuessTests(unittest.TestCase):
