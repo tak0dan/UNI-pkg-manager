@@ -97,8 +97,8 @@ def _notice(ctx: resolver.Context, intent: Intent, term: str, cand: Candidate) -
     implied = frontends.FRONTENDS[intent.syntax].backend
     ranking = ", ".join(f"{s} {ctx.priority(s)}" for s in ctx.enabled_ids())
     return (
-        f"Understood as: {intent.op} {term} -> resolved to {cand.source} "
-        f"(your priority: {ranking}; {intent.syntax} implies {implied}). "
+        f"Understood as: {intent.op} {term} -> {cand.source} "
+        f"({intent.syntax} commands normally use {implied}; your priorities: {ranking}). "
         "Change priorities in the config, or set [syntax] notice = false to hide this."
     )
 
@@ -246,9 +246,12 @@ def _run_transaction(intent: Intent, ctx: resolver.Context, cfg: dict, explicit:
         # The TUI is the confirmation, so native commands run non-interactively.
         return _build_steps(ctx, _dedupe(chosen), remove, yes=True)
 
+    outcome: dict = {}
+
     def on_done(chosen: list[Candidate], steps: list[Step], rc: int, output: list[str]) -> None:
         commands = [" ".join(s.argv) for s in steps]
         path = write_transaction(intent.op, " ".join(c.ref for c in chosen), commands, output, rc)
+        outcome.update(chosen=chosen, rc=rc, log=path)
         record({"type": "transaction", "op": intent.op, "syntax": intent.syntax,
                 "resolved": [c.describe() for c in chosen], "rc": rc, "log": path})
 
@@ -262,7 +265,20 @@ def _run_transaction(intent: Intent, ctx: resolver.Context, cfg: dict, explicit:
         notices=notices,
         on_done=on_done,
     )
-    return run_plan(plan)
+    rc = run_plan(plan)
+    # The interface draws on its own screen, which disappears on exit. Say the outcome here,
+    # where it stays in the terminal.
+    if outcome:
+        names = " ".join(c.ref for c in outcome["chosen"])
+        if outcome["rc"] == 0:
+            print(f"done: {intent.op} {names}")
+        else:
+            print(f"failed: {intent.op} {names} (exit {outcome['rc']})")
+        if outcome["log"]:
+            print(f"full output: {outcome['log']}")
+    else:
+        print("not run: cancelled or refused; nothing was changed")
+    return rc
 
 
 def _run_intent(intent: Intent, ctx: resolver.Context, cfg: dict, host: detect.Host,

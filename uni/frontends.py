@@ -115,8 +115,21 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
     return parse
 
 
-def _passthrough(syntax: str, args: list[str], read_only: bool = False) -> Passthrough:
+# uni-only options that a native command cannot understand. Forwarding them would fail in
+# the native manager, or worse, be silently taken as something else.
+UNI_ONLY = {"--with", "--accept-replacement", "--json"} | {
+    f"--{name}" for name in SOURCE_FLAGS
+}
+
+
+def _passthrough(syntax: str, args: list[str], read_only: bool = False) -> Passthrough | Invalid:
     """Hand the command to the native manager. --dry-run is honoured here, not forwarded."""
+    clash = [a for a in args if a.partition("=")[0] in UNI_ONLY]
+    if clash:
+        return Invalid(
+            f"{clash[0]} is a uni option and cannot be used with this native command; "
+            "drop it, or use the source's own syntax"
+        )
     dry = "--dry-run" in args
     kept = [a for a in args if a != "--dry-run"]
     return Passthrough(backend=syntax, argv=[syntax, *kept], syntax=syntax, read_only=read_only, dry_run=dry)
@@ -130,13 +143,11 @@ def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
     rest, opts, unknown = _scan(args[1:], ctx, {"--noconfirm"}, set(), ignored={"--needed"})
     if opts["error"]:
         return Invalid(opts["error"])
-    passthrough = _passthrough("pacman", args)
-    if unknown:
-        return passthrough
     read_only = letter in "QTVH" or (letter == "S" and mods and mods <= {"s", "i"})
-    passthrough.read_only = read_only
-    if mods - {"s"}:
-        return passthrough  # -Sy, -Syu, -Si, -Sc, -Rs, ... are manager-specific
+
+    if unknown or mods - {"s"}:
+        # -Sy, -Syu, -Si, -Sc, -Rs, -Qdt, ...: manager-specific, pass through unchanged.
+        return _passthrough("pacman", args, read_only=read_only)
     if letter == "S" and "s" in mods and rest:
         op = "search"
     elif letter == "S" and not mods and rest:
@@ -144,7 +155,7 @@ def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
     elif letter == "R" and not mods and rest:
         op = "remove"
     else:
-        return passthrough
+        return _passthrough("pacman", args, read_only=read_only)
     return Intent(op=op, terms=rest, syntax="pacman", source=opts["source"],
                   accept_replacement=opts["accept"], yes=opts["yes"] or "--noconfirm" in args,
                   dry_run=opts["dry_run"], json_out=opts["json"])
@@ -154,36 +165,42 @@ _READ_ONLY = {
     "apt": {"search", "show", "list", "policy", "madison"},
     "dnf": {"search", "list", "info", "repoquery", "provides"},
     "zypper": {"se", "search", "info", "if", "packages", "pa", "repos", "lr", "list-updates", "lu"},
-    "flatpak": {"search", "list", "info", "remotes", "remote-ls"},
+    "flatpak": {"search", "list", "info", "remotes", "remote-ls", "remote-list", "history", "documentation"},
 }
 
-_UNI_OPS = ("install", "remove", "search", "detect")
+
+
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    """Options accepted both before and after the verb. SUPPRESS keeps the other parser's value."""
+    sup = argparse.SUPPRESS
+    parser.add_argument("--from", dest="source", metavar="SOURCE", default=sup,
+                        help="search only this source, ignoring priorities (no fallback)")
+    for name in SOURCE_FLAGS:
+        parser.add_argument(f"--{name}", dest="source", action="store_const", const=name, default=sup,
+                            help=f"same as --from {name}")
+    parser.add_argument("--with", dest="source", metavar="SOURCE", default=sup,
+                        help="same as --from: translate the command to this source")
+    parser.add_argument("-y", "--yes", action="store_true", default=sup,
+                        help="never prompt; ties and replacements fail instead of asking")
+    parser.add_argument("--accept-replacement", action="store_true", default=sup,
+                        help="allow a fork/replacement package (e.g. swww -> awww)")
+    parser.add_argument("--dry-run", action="store_true", default=sup,
+                        help="print the native commands only")
+    parser.add_argument("--json", dest="json_out", action="store_true", default=sup,
+                        help="JSON output (search, detect, --dry-run)")
 
 
 def _uni_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--from", dest="source", metavar="SOURCE",
-                        help="search only this source, ignoring priorities (no fallback)")
-    for name in SOURCE_FLAGS:
-        common.add_argument(f"--{name}", dest="source", action="store_const", const=name,
-                            help=f"same as --from {name}")
-    common.add_argument("-y", "--yes", action="store_true",
-                        help="never prompt; ties and replacements fail instead of asking")
-    common.add_argument("--accept-replacement", action="store_true",
-                        help="allow a fork/replacement package (e.g. swww -> awww)")
-    common.add_argument("--with", dest="source", metavar="SOURCE",
-                        help="same as --from: translate the command to this source")
-    common.add_argument("--dry-run", action="store_true", help="print the native commands only")
-    common.add_argument("--json", dest="json_out", action="store_true",
-                        help="JSON output (search, detect, --dry-run)")
+    _add_common(common)
 
-    parser = argparse.ArgumentParser(prog="uni", description="Unified package manager wrapper.")
+    parser = argparse.ArgumentParser(prog="uni", description="Unified package manager wrapper.", parents=[common])
     parser.add_argument("--as", dest="as_syntax", metavar="SYNTAX", help="read commands in this syntax")
     parser.add_argument("--config", metavar="PATH", help="config file (default ~/.config/uni/config.toml)")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every native query to stderr")
     sub = parser.add_subparsers(dest="op", required=True)
     for op in ("install", "remove", "search"):
-        sp = sub.add_parser(op, parents=[common])
+        sp = sub.add_parser(op, parents=[common], aliases=["uninstall"] if op == "remove" else [])
         sp.add_argument("terms", nargs="+", metavar="PACKAGE")
     sub.add_parser("detect", parents=[common], help="show the detected host and sources")
     log = sub.add_parser("log", help="show recent uni activity")
@@ -194,7 +211,8 @@ def _uni_parser() -> argparse.ArgumentParser:
 def _parse_uni(args: list[str], ctx: ParseCtx) -> ParseResult:
     ns = _uni_parser().parse_args(args)
     # `log` and `detect` have fewer options; getattr keeps the Intent defaults for those.
-    return Intent(op=ns.op, terms=getattr(ns, "terms", []), syntax="uni",
+    op = "remove" if ns.op == "uninstall" else ns.op
+    return Intent(op=op, terms=getattr(ns, "terms", []), syntax="uni",
                   source=getattr(ns, "source", None),
                   accept_replacement=getattr(ns, "accept_replacement", False),
                   yes=getattr(ns, "yes", False), dry_run=getattr(ns, "dry_run", False),
