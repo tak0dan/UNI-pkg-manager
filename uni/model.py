@@ -1,0 +1,44 @@
+"""Data types shared by syntax frontends, the resolver and the backends."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Intent:
+    """One unified operation, produced by a syntax frontend."""
+
+    op: str  # install | remove | search | detect
+    terms: list[str] = field(default_factory=list)
+    syntax: str = "uni"
+    # Source to search exclusively: set by --from, or by the syntax in route mode.
+    source: str | None = None
+    accept_replacement: bool = False
+    yes: bool = False
+    dry_run: bool = False
+    json_out: bool = False
+
+
+@dataclass
+class Passthrough:
+    """A manager-specific command that goes to its native manager unchanged."""
+
+    backend: str
+    argv: list[str]
+    syntax: str
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A package that a backend says exists, under the name that backend understands."""
+
+    source: str
+    ref: str
+    version: str = ""
+    description: str = ""
+    remote: str | None = None  # flatpak remote the ref lives in
+
+    def describe(self) -> str:
+        return f"{self.source}: {self.ref}" + (f" {self.version}" if self.version else "")
