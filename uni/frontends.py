@@ -11,12 +11,13 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .capabilities import PACMAN_REMOVE_LETTERS
 from .model import Intent, Invalid, Passthrough
 
 ParseResult = Intent | Passthrough | Invalid
 
 # Every source that can be named with --<source> as shorthand for --from <source>.
-SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur")
+SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur", "paru", "yay", "nix")
 
 
 @dataclass
@@ -36,7 +37,7 @@ def _is_uni_flag_value(args: list[str], i: int, ctx: ParseCtx) -> bool:
     return i + 1 < len(args) and args[i + 1] in ctx.known_sources
 
 
-def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
+def _scan(args, ctx, yes_flags, dry_flags, ignored=(), native_flags=None):
     """Split args into positionals and uni-level options.
 
     Returns (positionals, options, unknown_flags). `--from` only counts as uni's
@@ -44,7 +45,9 @@ def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
     still passes through.
     """
     pos: list[str] = []
-    opts = {"source": None, "yes": False, "dry_run": False, "json": False, "accept": False, "error": None}
+    native_flags = native_flags or {}
+    opts = {"source": None, "yes": False, "dry_run": False, "json": False, "accept": False, "error": None,
+            "flags": set()}
     unknown: list[str] = []
     i = 0
     while i < len(args):
@@ -82,6 +85,8 @@ def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
             opts["json"] = True
         elif a == "--accept-replacement":
             opts["accept"] = True
+        elif a in native_flags:
+            opts["flags"].add(native_flags[a])
         elif a in ignored:
             pass
         elif a.startswith("-") and a != "-":
@@ -92,17 +97,21 @@ def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
     return pos, opts, unknown
 
 
-def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
-    """Frontend factory for apt/dnf/zypper/flatpak: `[flags] <op> [flags] <terms>`."""
+def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=(), native_flags=None):
+    """Frontend factory for apt/dnf/zypper/flatpak: `[flags] <op> [flags] <terms>`.
+
+    `ops` maps a native verb to (unified op, flags the verb implies); `apt purge` is
+    `remove` with the `purge` flag, so it keeps its meaning.
+    """
 
     def parse(args: list[str], ctx: ParseCtx) -> ParseResult:
-        pos, opts, unknown = _scan(args, ctx, yes_flags, dry_flags, ignored)
+        pos, opts, unknown = _scan(args, ctx, yes_flags, dry_flags, ignored, native_flags)
         if opts["error"]:
             return Invalid(opts["error"])
         passthrough = _passthrough(syntax, args, read_only=bool(pos) and pos[0] in read_only)
         if unknown or not pos or pos[0] not in ops:
             return passthrough
-        op = ops[pos[0]]
+        op, verb_flags = ops[pos[0]]
         terms = pos[1:]
         if syntax == "flatpak" and op == "install" and len(terms) > 1 and terms[0] in ctx.remotes():
             terms = terms[1:]  # `flatpak install flathub app`: the remote is implied by uni
@@ -110,7 +119,8 @@ def _generic(syntax, ops, yes_flags, dry_flags, read_only, ignored=()):
             return passthrough
         return Intent(op=op, terms=terms, syntax=syntax, source=opts["source"],
                       accept_replacement=opts["accept"], yes=opts["yes"],
-                      dry_run=opts["dry_run"], json_out=opts["json"])
+                      dry_run=opts["dry_run"], json_out=opts["json"],
+                      flags=frozenset(verb_flags | opts["flags"]))
 
     return parse
 
@@ -145,20 +155,36 @@ def _parse_pacman(args: list[str], ctx: ParseCtx) -> ParseResult:
         return Invalid(opts["error"])
     read_only = letter in "QTVH" or (letter == "S" and mods and mods <= {"s", "i"})
 
-    if unknown or mods - {"s"}:
-        # -Sy, -Syu, -Si, -Sc, -Rs, -Qdt, ...: manager-specific, pass through unchanged.
+    if unknown:
         return _passthrough("pacman", args, read_only=read_only)
-    if letter == "S" and "s" in mods and rest:
-        op = "search"
-    elif letter == "S" and not mods and rest:
-        op = "install"
-    elif letter == "R" and not mods and rest:
-        op = "remove"
+    if letter == "R":
+        # -R, or -R with -s/-n/-d/-dd: a remove whose native flags are carried along.
+        if mods and (not mods <= set("sndd") or args[0][2:].count("d") > 2):
+            return _passthrough("pacman", args, read_only=read_only)
+        op, flags = "remove", _pacman_remove_flags(args[0][2:])
+    elif letter == "S" and mods <= {"s"}:
+        if not mods and not rest:
+            return _passthrough("pacman", args, read_only=read_only)
+        op, flags = ("search" if mods else "install"), set()
     else:
+        # -Sy, -Syu, -Si, -Sc, -Qdt, ...: manager-specific, pass through unchanged.
+        return _passthrough("pacman", args, read_only=read_only)
+    if not rest:
         return _passthrough("pacman", args, read_only=read_only)
     return Intent(op=op, terms=rest, syntax="pacman", source=opts["source"],
                   accept_replacement=opts["accept"], yes=opts["yes"] or "--noconfirm" in args,
-                  dry_run=opts["dry_run"], json_out=opts["json"])
+                  dry_run=opts["dry_run"], json_out=opts["json"], flags=frozenset(flags))
+
+
+def _pacman_remove_flags(letters: str) -> set[str]:
+    """-s, -n, -d, -dd -> canonical flags. The second d means 'skip all checks'."""
+    flags: set[str] = set()
+    for letter in letters:
+        if letter == "d":
+            flags.add("nocheck" if "nodeps" in flags else "nodeps")
+        else:
+            flags.add(PACMAN_REMOVE_LETTERS[letter])
+    return flags
 
 
 _READ_ONLY = {
@@ -222,21 +248,30 @@ def _parse_uni(args: list[str], ctx: ParseCtx) -> ParseResult:
 FRONTENDS: dict[str, Frontend] = {
     "uni": Frontend("uni", None, _parse_uni),
     "apt": Frontend("apt", "apt", _generic(
-        "apt", {"install": "install", "remove": "remove", "purge": "remove", "search": "search"},
+        "apt",
+        {"install": ("install", frozenset()), "remove": ("remove", frozenset()),
+         "purge": ("remove", frozenset({"purge"})), "search": ("search", frozenset())},
         yes_flags={"-y", "--yes", "--assume-yes"}, dry_flags={"-s", "--simulate", "--just-print"},
-        read_only=_READ_ONLY["apt"], ignored={"-q", "--quiet"})),
+        read_only=_READ_ONLY["apt"], ignored={"-q", "--quiet"},
+        native_flags={"--purge": "purge"})),
     "dnf": Frontend("dnf", "dnf", _generic(
-        "dnf", {"install": "install", "remove": "remove", "erase": "remove", "search": "search"},
+        "dnf",
+        {"install": ("install", frozenset()), "remove": ("remove", frozenset()),
+         "erase": ("remove", frozenset()), "search": ("search", frozenset())},
         yes_flags={"-y", "--assumeyes"}, dry_flags=set(), read_only=_READ_ONLY["dnf"],
         ignored={"-q", "--quiet"})),
     "pacman": Frontend("pacman", "pacman", _parse_pacman),
     "zypper": Frontend("zypper", "zypper", _generic(
-        "zypper", {"install": "install", "in": "install", "remove": "remove", "rm": "remove",
-                   "search": "search", "se": "search"},
+        "zypper",
+        {"install": ("install", frozenset()), "in": ("install", frozenset()),
+         "remove": ("remove", frozenset()), "rm": ("remove", frozenset()),
+         "search": ("search", frozenset()), "se": ("search", frozenset())},
         yes_flags={"-n", "--non-interactive", "--no-confirm"}, dry_flags=set(),
         read_only=_READ_ONLY["zypper"], ignored={"-q", "--quiet"})),
     "flatpak": Frontend("flatpak", "flatpak", _generic(
-        "flatpak", {"install": "install", "uninstall": "remove", "search": "search"},
+        "flatpak",
+        {"install": ("install", frozenset()), "uninstall": ("remove", frozenset()),
+         "search": ("search", frozenset())},
         yes_flags={"-y", "--assumeyes"}, dry_flags=set(), read_only=_READ_ONLY["flatpak"])),
 }
 

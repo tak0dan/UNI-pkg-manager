@@ -1,8 +1,9 @@
 """The interactive interface for install and remove.
 
-One app runs the whole transaction: pick a package where names tie, confirm a
+It runs a planned transaction: pick a package where names tie, confirm a
 fork/replacement, review the plan, then watch the native output stream into the
-log. Textual is imported here, so the plain and JSON paths never load it.
+log. The plan itself is built by planner.py; this module only shows and runs it.
+Textual is imported here, so the plain and JSON paths never load it.
 
 Keys: Enter confirms, Esc cancels, q quits once the run has finished.
 """
@@ -13,23 +14,19 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .backends import Step
+from . import planner, resolver
 from .model import Candidate
-from .resolver import Resolution
-from .transaction import _as_root, arun, snapper_enabled
+from .planner import Draft, Plan, PlanError
+from .transaction import arun
 
 
 @dataclass
-class Plan:
-    title: str
+class Job:
+    draft: Draft
+    ctx: resolver.Context
     cfg: dict
-    label: str
-    resolutions: list[Resolution]
-    accept: list[bool]  # --accept-replacement per term
-    build: Callable[[list[Candidate]], list[Step]]  # chosen candidates -> native steps
-    notices: list[str]  # "Understood as" lines and similar, shown on the plan
-    # Called once the run ends: (chosen, steps, exit code, every output line).
-    on_done: Callable[[list[Candidate], list[Step], int, list[str]], None] | None = None
+    # Called once the run ends: (plan, exit code, every output line).
+    on_done: Callable[[Plan, int, list[str]], None] | None = None
 
 
 def _app_classes():
@@ -123,9 +120,9 @@ def _app_classes():
         CSS = "#status { padding: 0 1; background: $panel; }"
         BINDINGS = [("q", "quit_app", "Quit"), ("ctrl+c", "abort", "Abort")]
 
-        def __init__(self, plan: Plan):
+        def __init__(self, job: Job):
             super().__init__()
-            self.plan = plan
+            self.job = job
             self.result: int | None = None  # set when the flow has finished
             self.output: list[str] = []  # every line shown in the log view, kept for the transaction log
 
@@ -136,10 +133,14 @@ def _app_classes():
             yield Footer()
 
         def on_mount(self) -> None:
-            self.sub_title = self.plan.title
+            names = " ".join(r.term for r in self.job.draft.resolutions)
+            self.sub_title = f"{self.job.draft.intent.op} {names}"
             self._set_status("resolving")
-            for note in self.plan.notices:
-                self.log_line(note)
+            for res in self.job.draft.resolutions:
+                for note in res.notes:
+                    self.log_line(note)
+                for hint in res.hints:
+                    self.log_line(f"also in {hint.source} as {hint.ref} (off; use --{hint.source})")
             self.run_worker(self._flow(), exclusive=True)
 
         def log_line(self, text: str) -> None:
@@ -149,50 +150,53 @@ def _app_classes():
         def _set_status(self, text: str) -> None:
             self.query_one("#status", Static).update(text)
 
-        def _finish(self, rc: int, message: str, chosen=None, steps=None) -> None:
+        def _finish(self, rc: int, message: str, plan: Plan | None = None) -> None:
             self.result = rc
             self.log_line(message)
             self._set_status(f"{message}   [b]press q to close[/b]")
-            if self.plan.on_done is not None and steps is not None:
-                self.plan.on_done(chosen or [], steps, rc, self.output)
+            if self.job.on_done is not None and plan is not None:
+                self.job.on_done(plan, rc, self.output)
 
         async def _flow(self) -> None:
-            plan = self.plan
+            job = self.job
+            d, ctx, cfg = job.draft, job.ctx, job.cfg
+            if not d.ok:
+                return self._finish(d.failures[0][0], d.failures[0][1])
+
             chosen: list[Candidate] = []
-            for term, res, accept in zip((r.term for r in plan.resolutions), plan.resolutions, plan.accept):
-                for hint in res.hints:
-                    self.log_line(f"also in {hint.source} as {hint.ref} (off; use --{hint.source})")
-                if res.replacement and not accept:
-                    question = f"'{res.replacement}' is a different project replacing '{term}'. Use it instead?"
+            for i, res in enumerate(d.resolutions):
+                if res.replacement and i in d.forks():
+                    question = (f"'{res.replacement}' is a different project replacing '{res.term}'. "
+                                "Use it instead?")
                     if not await self.push_screen_wait(ConfirmScreen(question)):
                         return self._finish(4, "refused: replacement not confirmed")
                 if res.tie:
-                    commands = [" ; ".join(" ".join(s.argv) for s in plan.build([c])) for c in res.ranked]
-                    picked = await self.push_screen_wait(PickScreen(term, res.ranked, commands))
+                    options = [(c, planner.preview(d, c, ctx)) for c in res.ranked]
+                    picked = await self.push_screen_wait(PickScreen(res.term, [c for c, _ in options],
+                                                                    [cmd for _, cmd in options]))
                     if picked is None:
-                        return self._finish(1, f"cancelled: '{term}' not chosen")
+                        return self._finish(1, f"cancelled: '{res.term}' not chosen")
                     chosen.append(picked)
                 else:
                     chosen.append(res.best)
 
-            steps = plan.build(chosen)
-            lines = ["[b]Plan[/b]"]
-            lines += [f"  {c.source:<8} {c.ref} {c.version}".rstrip() for c in chosen]
-            sudo = plan.cfg["general"]["sudo"]
-            lines += ["", "[b]Commands[/b]"]
-            if snapper_enabled(plan.cfg):
-                lines.append("  snapshot before and after (snapper)")
-            lines += [f"  $ {' '.join(_as_root(s.argv, s.root, sudo))}" for s in steps]
-            lines += ["", *plan.notices]
-            if not await self.push_screen_wait(PlanScreen(lines)):
+            try:
+                plan = planner.finalize(d, chosen, ctx, cfg, assume_yes=True)
+            except PlanError as exc:
+                for line in exc.message.splitlines():
+                    self.log_line(line)
+                return self._finish(exc.code, "not run: the plan is invalid; nothing was changed")
+
+            sudo = cfg["general"]["sudo"]
+            if not await self.push_screen_wait(PlanScreen(plan.render(sudo) + ["", "[b]Enter[/b] run   [b]Esc[/b] cancel"])):
                 return self._finish(1, "cancelled before running anything")
 
             self._set_status("running")
-            rc = await arun(steps, plan.cfg, plan.label, self.log_line, self._suspend_run)
+            rc = await arun(plan.steps, cfg, plan.label, self.log_line, self._suspend_run)
             if rc == 0:
-                self._finish(0, "done", chosen, steps)
+                self._finish(0, "done", plan)
             else:
-                self._finish(rc, f"failed with status {rc}", chosen, steps)
+                self._finish(rc, f"failed with status {rc}", plan)
 
         def _suspend_run(self, argv: list[str]) -> int:
             with self.suspend():
@@ -214,14 +218,12 @@ def _app_classes():
     return UniApp
 
 
-def run_plan(plan: Plan) -> int:
+def run_job(job: Job) -> int:
     """Run the interactive flow and return the transaction's exit code."""
-    app_cls = _app_classes()
-    app = app_cls(plan)
-    rc = app.run()
+    rc = _app_classes()(job).run()
     return 1 if rc is None else rc
 
 
-def make_app(plan: Plan):
+def make_app(job: Job):
     """Used by the tests to drive the app headlessly."""
-    return _app_classes()(plan)
+    return _app_classes()(job)

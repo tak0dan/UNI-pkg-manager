@@ -7,7 +7,8 @@ flatpak = { enabled = true,  priority = 2 }
 snap    = { enabled = false, priority = 3 }
 # AUR and snap are off by default: they are never picked automatically.
 # Their matches still appear as hints and in `uni search`.
-aur     = { enabled = false, priority = 4, helper = "paru" }
+aur     = { enabled = false, priority = 4 }   # helper: "paru" or "yay"; default: first installed
+nix     = { enabled = false, priority = 5 }
 
 [pins]
 # Prefer one source for a specific name, e.g. discord = "flatpak"

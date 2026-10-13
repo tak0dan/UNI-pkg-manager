@@ -7,14 +7,14 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from . import backends, config, detect, frontends, resolver
+from . import backends, config, detect, frontends, planner, resolver
 from .backends import Step
 from .frontends import ParseCtx
 from .model import Candidate, Intent, Invalid, Passthrough
+from .planner import Plan, PlanError
 from .render import (emit_json, format_entry, make_trace, read_log, record, search_table, warn,
                      write_transaction)
 from .repology import Repology
-from .resolver import Resolution
 from .transaction import UnsafeCommand, execute
 
 EXIT_OK, EXIT_ERROR, EXIT_AMBIGUOUS, EXIT_NOT_FOUND, EXIT_REFUSED = 0, 1, 2, 3, 4
@@ -46,12 +46,28 @@ def _take_option(argv: list[str], flag: str) -> tuple[str | None, list[str]]:
     return value, rest
 
 
+# uni-only options that can come before the native command word.
+_LEADING_VALUE_OPTIONS = {"--with", "--from"}
+_LEADING_FLAGS = {"--yes", "-y", "--dry-run", "--json", "--accept-replacement"}
+
+
 def _guess_syntax(argv: list[str]) -> tuple[str | None, list[str]]:
-    """`uni apt install x` and `uni -S x` select a syntax without --as."""
-    if argv and argv[0] in frontends.FRONTENDS and argv[0] != "uni":
-        return argv[0], argv[1:]
-    if argv and PACMAN_FLAGS.match(argv[0]):
-        return "pacman", argv
+    """`uni apt install x`, `uni -S x` and `uni --with flatpak -S x` select a syntax without --as."""
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in _LEADING_VALUE_OPTIONS and i + 1 < len(argv):
+            i += 2
+        elif token in _LEADING_FLAGS or (token.startswith("--") and token[2:] in frontends.SOURCE_FLAGS):
+            i += 1
+        else:
+            break
+    head = argv[i] if i < len(argv) else ""
+    if head in frontends.FRONTENDS and head != "uni":
+        return head, argv[:i] + argv[i + 1:]
+    if head and PACMAN_FLAGS.match(head):
+        # pacman's parser needs its own command word first; uni's options follow it.
+        return "pacman", argv[i:] + argv[:i]
     return None, argv
 
 
@@ -72,35 +88,6 @@ def build_context(cfg: dict) -> tuple[resolver.Context, detect.Host]:
         ttl_hours=cfg["resolver"]["cache_hours"],
     )
     return resolver.Context(cfg, available, host.native, db, repology), host
-
-
-def _build_steps(ctx: resolver.Context, chosen: list[Candidate], remove: bool, yes: bool) -> list[Step]:
-    by_backend: dict[str, list[Candidate]] = {}
-    for cand in chosen:
-        by_backend.setdefault(cand.source, []).append(cand)
-    steps: list[Step] = []
-    for sid, cands in by_backend.items():
-        backend = ctx.backends[sid]
-        steps += backend.remove(cands, yes) if remove else backend.install(cands, yes)
-    return steps
-
-
-def _dedupe(chosen: list[Candidate]) -> list[Candidate]:
-    unique: dict[tuple[str, str], Candidate] = {}
-    for cand in chosen:
-        unique.setdefault((cand.source, cand.ref), cand)
-    return list(unique.values())
-
-
-def _notice(ctx: resolver.Context, intent: Intent, term: str, cand: Candidate) -> str:
-    """The 'Understood as' line: explains a translated command that resolved elsewhere."""
-    implied = frontends.FRONTENDS[intent.syntax].backend
-    ranking = ", ".join(f"{s} {ctx.priority(s)}" for s in ctx.enabled_ids())
-    return (
-        f"Understood as: {intent.op} {term} -> {cand.source} "
-        f"({intent.syntax} commands normally use {implied}; your priorities: {ranking}). "
-        "Change priorities in the config, or set [syntax] notice = false to hide this."
-    )
 
 
 def _detect(ctx: resolver.Context, host: detect.Host, json_out: bool) -> int:
@@ -173,116 +160,83 @@ def _run_search(intent: Intent, ctx: resolver.Context, source: str | None) -> in
     return EXIT_OK
 
 
-def _resolve_terms(intent: Intent, ctx: resolver.Context, source: str | None):
-    """Resolve each term. Returns (resolutions, failures)."""
-    remove = intent.op == "remove"
-    resolutions: list[Resolution] = []
-    failures: list[tuple[int, str]] = []
-    for term in intent.terms:
-        res = resolver.resolve(term, ctx, source, installed_only=remove)
-        resolutions.append(res)
+def _report_resolution(d) -> None:
+    for res in d.resolutions:
         for note in res.notes:
             warn(note)
-        record({"type": "resolve", "term": term, "chosen": [c.describe() for c in res.ranked[:1]],
+        record({"type": "resolve", "term": res.term, "chosen": [c.describe() for c in res.ranked[:1]],
                 "tie": res.tie, "hints": [c.describe() for c in res.hints], "error": res.error})
-        if res.error:
-            failures.append((res.code or EXIT_ERROR, res.error))
-    return resolutions, failures
 
 
-def _run_transaction(intent: Intent, ctx: resolver.Context, cfg: dict, explicit: bool, routed: bool) -> int:
-    remove = intent.op == "remove"
-    source = intent.source
+def _run_transaction(intent: Intent, ctx: resolver.Context, cfg: dict) -> int:
+    """draft -> choices -> plan -> run. Nothing changes before the plan is complete."""
+    d = planner.draft(intent, ctx)
+    _report_resolution(d)
+    if not d.ok:
+        for _, msg in d.failures:
+            warn(msg)
+        return d.failures[0][0]
+
     interactive = (sys.stdin.isatty() and sys.stdout.isatty()
                    and not (intent.yes or intent.json_out or intent.dry_run))
+    if interactive:
+        from .tui import Job, run_job
 
-    resolutions, failures = _resolve_terms(intent, ctx, source)
-    if failures:
-        for _, msg in failures:
-            warn(msg)
-        return failures[0][0]
+        outcome: dict = {}
 
-    notices: list[str] = []
-    implied = frontends.FRONTENDS[intent.syntax].backend
-    translated = intent.syntax != "uni" and not explicit and not routed and cfg["syntax"]["notice"]
-    for term, res in zip(intent.terms, resolutions):
-        if translated and res.best and res.best.source != implied:
-            notices.append(_notice(ctx, intent, term, res.best))
+        def on_done(plan: Plan, rc: int, output: list[str]) -> None:
+            path = write_transaction(intent.op, plan.label, [" ".join(c) for c in plan.commands()], output, rc)
+            outcome.update(plan=plan, rc=rc, log=path)
+            record({"type": "transaction", "op": intent.op, "syntax": intent.syntax,
+                    "resolved": [c.describe() for _, c in plan.items], "rc": rc, "log": path})
 
-    if not interactive:
-        chosen: list[Candidate] = []
-        for term, res in zip(intent.terms, resolutions):
-            if res.replacement and not intent.accept_replacement:
-                warn(f"'{term}' resolves to '{res.replacement}', a different project; "
-                     "rerun with --accept-replacement")
-                return EXIT_REFUSED
-            if res.tie:
-                options = ", ".join(c.describe() for c in res.ranked)
-                warn(f"'{term}' is ambiguous ({options}); run in a terminal to choose")
-                return EXIT_AMBIGUOUS
-            chosen.append(res.best)
-        chosen = _dedupe(chosen)
-        steps = _build_steps(ctx, chosen, remove, intent.yes)
-        if intent.json_out:
-            emit_json({"op": intent.op, "resolved": [asdict(c) for c in chosen],
-                       "commands": [s.argv for s in steps]})
-            return EXIT_OK
-        for note in notices:
-            print(note)
-        for term, cand in zip(intent.terms, chosen):
-            print(f"{term} -> {cand.source} {cand.ref} {cand.version}".rstrip())
-        try:
-            rc = execute(steps, cfg, dry_run=intent.dry_run, label=f"{intent.op} " + " ".join(c.ref for c in chosen))
-        except UnsafeCommand as exc:
-            warn(str(exc))
-            return EXIT_REFUSED
-        record({"type": "transaction", "op": intent.op, "syntax": intent.syntax, "dry_run": intent.dry_run,
-                "resolved": [c.describe() for c in chosen], "rc": rc})
+        rc = run_job(Job(draft=d, ctx=ctx, cfg=cfg, on_done=on_done))
+        # The interface draws on its own screen, which disappears on exit. Say the outcome here,
+        # where it stays in the terminal.
+        if outcome:
+            names = " ".join(c.ref for _, c in outcome["plan"].items)
+            if outcome["rc"] == 0:
+                print(f"done: {intent.op} {names}")
+            else:
+                print(f"failed: {intent.op} {names} (exit {outcome['rc']})")
+            if outcome["log"]:
+                print(f"full output: {outcome['log']}")
+        else:
+            print("not run: cancelled or refused; nothing was changed")
         return rc
 
-    from .tui import Plan, run_plan
+    # Plain mode: no choices are made silently.
+    for res in d.resolutions:
+        if res.replacement and d.forks():
+            warn(f"'{res.term}' resolves to '{res.replacement}', a different project; "
+                 "rerun with --accept-replacement")
+            return EXIT_REFUSED
+        if res.tie:
+            options = ", ".join(c.describe() for c in res.ranked)
+            warn(f"'{res.term}' is ambiguous ({options}); run in a terminal to choose")
+            return EXIT_AMBIGUOUS
+    try:
+        plan = planner.finalize(d, [res.best for res in d.resolutions], ctx, cfg, assume_yes=intent.yes)
+    except PlanError as exc:
+        warn(exc.message)
+        return exc.code
 
-    def build(chosen: list[Candidate]) -> list[Step]:
-        # The TUI is the confirmation, so native commands run non-interactively.
-        return _build_steps(ctx, _dedupe(chosen), remove, yes=True)
-
-    outcome: dict = {}
-
-    def on_done(chosen: list[Candidate], steps: list[Step], rc: int, output: list[str]) -> None:
-        commands = [" ".join(s.argv) for s in steps]
-        path = write_transaction(intent.op, " ".join(c.ref for c in chosen), commands, output, rc)
-        outcome.update(chosen=chosen, rc=rc, log=path)
-        record({"type": "transaction", "op": intent.op, "syntax": intent.syntax,
-                "resolved": [c.describe() for c in chosen], "rc": rc, "log": path})
-
-    plan = Plan(
-        title=f"{intent.op} {' '.join(intent.terms)}",
-        cfg=cfg,
-        label=f"{intent.op} " + " ".join(intent.terms),
-        resolutions=resolutions,
-        accept=[intent.accept_replacement] * len(resolutions),
-        build=build,
-        notices=notices,
-        on_done=on_done,
-    )
-    rc = run_plan(plan)
-    # The interface draws on its own screen, which disappears on exit. Say the outcome here,
-    # where it stays in the terminal.
-    if outcome:
-        names = " ".join(c.ref for c in outcome["chosen"])
-        if outcome["rc"] == 0:
-            print(f"done: {intent.op} {names}")
-        else:
-            print(f"failed: {intent.op} {names} (exit {outcome['rc']})")
-        if outcome["log"]:
-            print(f"full output: {outcome['log']}")
-    else:
-        print("not run: cancelled or refused; nothing was changed")
+    if intent.json_out:
+        emit_json(plan.to_dict())
+        return EXIT_OK
+    for line in plan.render(cfg["general"]["sudo"]):
+        print(line)
+    try:
+        rc = execute(plan.steps, cfg, dry_run=intent.dry_run, label=plan.label)
+    except UnsafeCommand as exc:
+        warn(str(exc))
+        return EXIT_REFUSED
+    record({"type": "transaction", "op": intent.op, "syntax": intent.syntax, "dry_run": intent.dry_run,
+            "resolved": [c.describe() for _, c in plan.items], "rc": rc})
     return rc
 
 
-def _run_intent(intent: Intent, ctx: resolver.Context, cfg: dict, host: detect.Host,
-                explicit: bool, routed: bool) -> int:
+def _run_intent(intent: Intent, ctx: resolver.Context, cfg: dict, host: detect.Host) -> int:
     if intent.op == "detect":
         return _detect(ctx, host, intent.json_out)
     if intent.op == "log":
@@ -297,7 +251,7 @@ def _run_intent(intent: Intent, ctx: resolver.Context, cfg: dict, host: detect.H
             return EXIT_ERROR
     if intent.op == "search":
         return _run_search(intent, ctx, intent.source)
-    return _run_transaction(intent, ctx, cfg, explicit, routed)
+    return _run_transaction(intent, ctx, cfg)
 
 
 def main(argv: list[str] | None = None, prog: str | None = None) -> int:
@@ -347,9 +301,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     if isinstance(parsed, Passthrough):
         return _run_passthrough(parsed, ctx, cfg)
 
-    explicit = parsed.source is not None
-    routed = False
-    if syntax in cfg["syntax"]["route"] and not explicit:
+    # Route mode: the syntax names its own source, unless the command already named one.
+    if syntax in cfg["syntax"]["route"] and parsed.source is None:
         parsed.source = frontends.FRONTENDS[syntax].backend
-        routed = True
-    return _run_intent(parsed, ctx, cfg, host, explicit, routed)
+    return _run_intent(parsed, ctx, cfg, host)

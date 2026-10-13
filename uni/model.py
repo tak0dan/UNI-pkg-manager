@@ -14,6 +14,8 @@ class Intent:
     syntax: str = "uni"
     # Source to search exclusively: set by --from, or by the syntax in route mode.
     source: str | None = None
+    # Native flags with a meaning of their own (canonical names, see capabilities.py).
+    flags: frozenset[str] = frozenset()
     accept_replacement: bool = False
     yes: bool = False
     dry_run: bool = False

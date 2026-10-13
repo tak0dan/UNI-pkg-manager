@@ -12,7 +12,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .backends import Backend
+from .backends import Backend, BackendError
 from .model import Candidate
 from .repology import Repology
 
@@ -74,6 +74,7 @@ class Context:
         self.native = native
         self.db = db
         self.repology = repology
+        self.warnings: list[str] = []  # backend failures seen during resolution, shown as notes
 
     def concrete(self, name: str) -> str | None:
         """Turn the config's logical 'native' into the detected manager's id."""
@@ -122,7 +123,12 @@ def _lookup(lookup: str, ctx: Context, sources: list[str]) -> list[Candidate]:
     seen: set[tuple[str, str]] = set()
     for sid in sources:
         for name in names.get(sid, []):
-            for cand in ctx.backends[sid].query(name):
+            try:
+                found = ctx.backends[sid].query(name)
+            except BackendError as exc:
+                ctx.warnings.append(f"{exc} (while looking up '{name}')")
+                continue
+            for cand in found:
                 if (cand.source, cand.ref) not in seen:
                     seen.add((cand.source, cand.ref))
                     cands.append(cand)
@@ -156,8 +162,9 @@ def resolve(term: str, ctx: Context, source: str | None = None, installed_only: 
             return res
 
     cands = _lookup(lookup, ctx, sources)
-    res.notes.extend(ctx.repology.warnings)
+    res.notes.extend(ctx.repology.warnings + ctx.warnings)
     ctx.repology.warnings.clear()
+    ctx.warnings.clear()
 
     if installed_only:
         cands = [c for c in cands if ctx.backends[c.source].installed(c.ref)]
@@ -201,7 +208,11 @@ def search(term: str, ctx: Context, source: str | None = None) -> list[Candidate
     sources = [source] if source else ctx.available_ids()
     found: list[Candidate] = []
     for sid in sources:
-        found.extend(ctx.backends[sid].search(term))
+        try:
+            found.extend(ctx.backends[sid].search(term))
+        except BackendError as exc:
+            ctx.warnings.append(str(exc))
+    ctx.warnings.clear()  # search reports its own warnings through the caller
 
     def key(c: Candidate):
         on = ctx.enabled(c.source)

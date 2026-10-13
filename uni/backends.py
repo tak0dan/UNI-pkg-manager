@@ -2,7 +2,8 @@
 
 A backend answers questions (query, search, installed) and turns resolved
 candidates into native commands (install, remove). It never runs a transaction
-itself; that is transaction.py's job.
+itself; that is transaction.py's job. Whether a native flag can be expressed by
+a backend is decided by capabilities.py, which the planner consults.
 """
 
 from __future__ import annotations
@@ -20,6 +21,15 @@ from dataclasses import dataclass
 from .model import Candidate
 
 AUR_RPC = "https://aur.archlinux.org/rpc/v5"
+
+
+class BackendError(Exception):
+    """A backend could not do what was asked. Always names the backend."""
+
+    def __init__(self, backend: str, message: str):
+        super().__init__(f"{backend}: {message}")
+        self.backend = backend
+        self.message = message
 
 
 @dataclass
@@ -76,6 +86,8 @@ class Backend:
     binary = ""
     native = False  # True for the distro's own manager
     needs_root = False
+    # Native remove flags this backend can express (canonical names, see capabilities.py).
+    remove_flags: frozenset[str] = frozenset()
 
     def __init__(self, options: dict | None = None):
         self.options = options or {}
@@ -96,7 +108,7 @@ class Backend:
     def install(self, cands: list[Candidate], yes: bool) -> list[Step]:
         raise NotImplementedError
 
-    def remove(self, cands: list[Candidate], yes: bool) -> list[Step]:
+    def remove(self, cands: list[Candidate], yes: bool, flags: frozenset[str] = frozenset()) -> list[Step]:
         raise NotImplementedError
 
 
@@ -105,6 +117,7 @@ class PacmanBackend(Backend):
     binary = "pacman"
     native = True
     needs_root = True
+    remove_flags = frozenset({"cascade", "nosave", "nodeps", "nocheck"})
 
     def query(self, name):
         rc, out = run(["pacman", "-Si", name])
@@ -133,23 +146,36 @@ class PacmanBackend(Backend):
         return run(["pacman", "-Q", ref])[0] == 0
 
     def install(self, cands, yes):
+        # No --needed: an explicit install reinstalls, as the user asked.
         refs = [c.ref for c in cands]
         return [Step(["pacman", "-S", *_yes("--noconfirm", yes), *refs], True)]
 
-    def remove(self, cands, yes):
+    def remove(self, cands, yes, flags=frozenset()):
         refs = [c.ref for c in cands]
-        return [Step(["pacman", "-R", *_yes("--noconfirm", yes), *refs], True)]
+        letters = ("n" if "nosave" in flags else "") + ("s" if "cascade" in flags else "")
+        if "nocheck" in flags:
+            letters += "dd"
+        elif "nodeps" in flags:
+            letters += "d"
+        op = "-R" + letters
+        return [Step(["pacman", op, *_yes("--noconfirm", yes), *refs], True)]
 
 
 class AurBackend(Backend):
-    """AUR: queried over the RPC JSON API, installed through a helper (paru/yay)."""
+    """AUR: queried over the RPC JSON API, installed through a helper (paru or yay).
+
+    `aur` uses whichever helper is configured or installed; `paru` and `yay` pin one.
+    All three are pacman-based once installed, so removal goes through pacman.
+    """
 
     id = "aur"
     needs_root = False
+    remove_flags = PacmanBackend.remove_flags
 
-    def __init__(self, options=None):
+    def __init__(self, options=None, source_id: str = "aur", helper: str | None = None):
         super().__init__(options)
-        self.binary = self.options.get("helper", "paru")
+        self.id = source_id
+        self.binary = helper or self.options.get("helper", "paru")
 
     def _rpc(self, endpoint: str, params: list[tuple[str, str]]) -> list[dict]:
         url = f"{AUR_RPC}/{endpoint}?{urllib.parse.urlencode(params)}"
@@ -174,14 +200,27 @@ class AurBackend(Backend):
         return run(["pacman", "-Q", ref])[0] == 0
 
     def install(self, cands, yes):
-        refs = [c.ref for c in cands]
         # The helper reviews PKGBUILDs and asks questions, so it always runs interactively.
-        return [Step([self.binary, "-S", *refs], interactive=True)]
+        return [Step([self.binary, "-S", *[c.ref for c in cands]], interactive=True)]
 
-    def remove(self, cands, yes):
-        # AUR packages are ordinary pacman packages once installed.
-        refs = [c.ref for c in cands]
-        return [Step(["pacman", "-R", *_yes("--noconfirm", yes), *refs], True)]
+    def remove(self, cands, yes, flags=frozenset()):
+        return PacmanBackend().remove(cands, yes, flags)
+
+
+class ParuBackend(AurBackend):
+    id = "paru"  # the registry is keyed by class id, so each helper declares its own
+    binary = "paru"
+
+    def __init__(self, options=None):
+        super().__init__(options, source_id="paru", helper="paru")
+
+
+class YayBackend(AurBackend):
+    id = "yay"
+    binary = "yay"
+
+    def __init__(self, options=None):
+        super().__init__(options, source_id="yay", helper="yay")
 
 
 class AptBackend(Backend):
@@ -189,6 +228,7 @@ class AptBackend(Backend):
     binary = "apt"
     native = True
     needs_root = True
+    remove_flags = frozenset({"purge"})
 
     def query(self, name):
         rc, out = run(["apt-cache", "show", "--no-all-versions", name])
@@ -215,8 +255,9 @@ class AptBackend(Backend):
     def install(self, cands, yes):
         return [Step(["apt", "install", *_yes("-y", yes), *[c.ref for c in cands]], True)]
 
-    def remove(self, cands, yes):
-        return [Step(["apt", "remove", *_yes("-y", yes), *[c.ref for c in cands]], True)]
+    def remove(self, cands, yes, flags=frozenset()):
+        verb = "purge" if "purge" in flags else "remove"
+        return [Step(["apt", verb, *_yes("-y", yes), *[c.ref for c in cands]], True)]
 
 
 class DnfBackend(Backend):
@@ -250,7 +291,7 @@ class DnfBackend(Backend):
     def install(self, cands, yes):
         return [Step(["dnf", "install", *_yes("-y", yes), *[c.ref for c in cands]], True)]
 
-    def remove(self, cands, yes):
+    def remove(self, cands, yes, flags=frozenset()):
         return [Step(["dnf", "remove", *_yes("-y", yes), *[c.ref for c in cands]], True)]
 
 
@@ -286,9 +327,9 @@ class ZypperBackend(Backend):
         flags = ["--non-interactive"] if yes else []
         return [Step(["zypper", *flags, "install", *[c.ref for c in cands]], True)]
 
-    def remove(self, cands, yes):
-        flags = ["--non-interactive"] if yes else []
-        return [Step(["zypper", *flags, "remove", *[c.ref for c in cands]], True)]
+    def remove(self, cands, yes, flags=frozenset()):
+        flags_ = ["--non-interactive"] if yes else []
+        return [Step(["zypper", *flags_, "remove", *[c.ref for c in cands]], True)]
 
 
 class FlatpakBackend(Backend):
@@ -328,7 +369,7 @@ class FlatpakBackend(Backend):
             steps.append(Step(["flatpak", "install", *_yes("-y", yes), *remote_arg, *refs]))
         return steps
 
-    def remove(self, cands, yes):
+    def remove(self, cands, yes, flags=frozenset()):
         return [Step(["flatpak", "uninstall", *_yes("-y", yes), *[c.ref for c in cands]])]
 
 
@@ -367,22 +408,80 @@ class SnapBackend(Backend):
     def install(self, cands, yes):
         return [Step(["snap", "install", *[c.ref for c in cands]], True)]
 
-    def remove(self, cands, yes):
+    def remove(self, cands, yes, flags=frozenset()):
         return [Step(["snap", "remove", *[c.ref for c in cands]], True)]
+
+
+NIX_FLAGS = ["--extra-experimental-features", "nix-command flakes"]
+
+
+class NixBackend(Backend):
+    """Nix: imperative profile operations through `nix profile` and `nix search`.
+
+    Packages are addressed as nixpkgs#<attribute>. Needs flakes enabled, which the
+    commands request explicitly. Not yet tested against a live Nix installation.
+    """
+
+    id = "nix"
+    binary = "nix"
+    native = False
+    needs_root = False
+
+    def _rows(self, term: str) -> list[Candidate]:
+        rc, out = run(["nix", *NIX_FLAGS, "search", "--json", "nixpkgs", term])
+        if rc or not out.strip():
+            return []
+        try:
+            data = json.loads(out)
+        except ValueError:
+            raise BackendError(self.id, "could not read `nix search` output")
+        results = []
+        for key, info in data.items():
+            # keys look like legacyPackages.x86_64-linux.<attribute>
+            attr = key.split(".", 2)[2] if key.count(".") >= 2 else key
+            results.append(Candidate(self.id, attr, info.get("version", ""), info.get("description", "")))
+        return results
+
+    def query(self, name):
+        return [c for c in self._rows(name) if c.ref == name]
+
+    def search(self, term):
+        return self._rows(term)
+
+    def installed(self, ref):
+        rc, out = run(["nix", *NIX_FLAGS, "profile", "list"])
+        return rc == 0 and any(ref in line.split() for line in out.splitlines())
+
+    def install(self, cands, yes):
+        return [Step(["nix", *NIX_FLAGS, "profile", "install", f"nixpkgs#{c.ref}"]) for c in cands]
+
+    def remove(self, cands, yes, flags=frozenset()):
+        return [Step(["nix", *NIX_FLAGS, "profile", "remove", c.ref]) for c in cands]
 
 
 REGISTRY: dict[str, type[Backend]] = {
     cls.id: cls
-    for cls in (PacmanBackend, AptBackend, DnfBackend, ZypperBackend, FlatpakBackend, SnapBackend, AurBackend)
+    for cls in (PacmanBackend, AptBackend, DnfBackend, ZypperBackend, FlatpakBackend, SnapBackend,
+                NixBackend, AurBackend, ParuBackend, YayBackend)
 }
 
 
 def make_backends(cfg: dict) -> dict[str, Backend]:
-    """Instantiate every backend whose binary exists on this host."""
+    """Instantiate every backend whose binary exists on this host.
+
+    `aur` runs through the helper named in its config, falling back to the first helper found.
+    """
     found: dict[str, Backend] = {}
     for bid, cls in REGISTRY.items():
         options = cfg["sources"].get(bid, {})
-        backend = cls(options)
+        if bid == "aur":
+            helper = options.get("helper") or next(
+                (h for h in ("paru", "yay") if shutil.which(h)), None)
+            if helper is None:
+                continue  # no AUR helper: the aur source is unavailable
+            backend = AurBackend(options, source_id="aur", helper=helper)
+        else:
+            backend = cls(options)
         if backend.available():
             found[bid] = backend
     return found
