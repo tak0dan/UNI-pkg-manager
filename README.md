@@ -11,22 +11,45 @@ uni --as flatpak install com.discordapp.Discord --dry-run
 
 Design notes: [UNI_DESIGN.md](UNI_DESIGN.md).
 
+## Install
+
+**Arch Linux** (and derivatives such as Garuda, EndeavourOS, Manjaro): one line, builds and installs a pacman package.
+
+```sh
+git clone https://github.com/tak0dan/UNI-pkg-manager && cd UNI-pkg-manager && makepkg -si
+```
+
+**Other distributions**: installs into an isolated environment with `pipx`.
+
+```sh
+pipx install git+https://github.com/tak0dan/UNI-pkg-manager.git
+```
+
+Check it works:
+
+```sh
+uni detect
+```
+
+Uninstall: `sudo pacman -R uni-pkg-git` on Arch, or `pipx uninstall uni-pkg` otherwise.
+
 ## Status
 
-Implemented (MVP from the design):
+Implemented:
 
-- Backends: pacman, AUR (via paru/yay, disabled by default), apt, dnf, zypper, flatpak, snap.
-- uni's own syntax: `install`, `remove`, `search`, `detect`.
-- Foreign syntaxes: apt, dnf, pacman, zypper, flatpak. Unified ops translate; anything
-  else passes straight through to the native manager.
+- Backends: pacman, AUR (via paru/yay), apt, dnf, zypper, flatpak, snap.
+- uni's own syntax: `install`, `remove`, `search`, `detect`, `log`. Foreign syntaxes: apt,
+  dnf, pacman, zypper, flatpak. Unified ops translate; anything else passes straight through.
 - Name resolution: bundled and user alias tables, then Repology (cached), then the literal name.
   Every name is verified live against each source.
-- Source hierarchy: priorities, per-term pins, `--from SOURCE` (exclusive, no fallback).
+- Source hierarchy: priorities, per-term pins, `--from SOURCE` or `--<source>` (exclusive, no fallback).
+- Sources that are off (AUR, snap by default) are never chosen automatically, but matches are
+  shown as hints and in `search`.
 - Renames vs forks: `renamed` resolves automatically; `fork` asks first (`--accept-replacement`).
-- Safety: refuses `pacman -S…` forms that refresh without upgrading (`-Sy <pkg>`); optional
-  snapper pre/post snapshots around each transaction.
-- Route and translate modes; the "Understood as" notice.
-- Textual picker shown only on real ties; `--yes`, non-TTY, and `--json` never prompt.
+- Safety: refuses `pacman -Sy <pkg>`; optional snapper pre/post snapshots around each transaction.
+- Interface: a Textual flow for install and remove (pick on ties, plan review, sudo once, live output).
+- Logs: every native query, every resolution and every transaction; each transaction keeps its
+  full output in a file.
 
 Not implemented yet: Pacstall, COPR, OBS, PPA/extrepo sources; the pkgmap data source;
 fleet dispatch.
@@ -34,20 +57,33 @@ fleet dispatch.
 ## Usage
 
 ```
-uni install <name>...   [--from SOURCE] [--dry-run] [--yes] [--accept-replacement]
-uni remove  <name>...   [--from SOURCE] [--dry-run] [--yes]
-uni search  <term>...   [--from SOURCE] [--json]
+uni install <name>...   [--from SOURCE | --<source>] [--dry-run] [--yes] [--accept-replacement]
+uni remove  <name>...   [--from SOURCE | --<source>] [--dry-run] [--yes]
+uni search  <term>...   [--from SOURCE | --<source>] [--json]
 uni detect              [--json]
+uni log                 [-n COUNT]
 ```
 
-- `--as SYNTAX` picks the input syntax (`uni`, `apt`, `dnf`, `pacman`, `zypper`, `flatpak`).
-  A symlink named `uni-<syntax>` does the same.
+- Syntax: `uni -S steam` and `uni apt install steam` pick the syntax from the first word.
+  `--as SYNTAX` forces one; a symlink named `uni-<syntax>` does the same.
+- Sources: `--flatpak`, `--aur`, `--snap`, `--pacman`, `--apt`, `--dnf`, `--zypper`, `--native`
+  are shorthand for `--from <source>`. `--from` is exclusive: nothing falls back.
+- Install and remove open the interface in a terminal. Enter confirms, Esc cancels, `q` closes
+  when the run has finished. Native commands run non-interactively after you confirm, except
+  the AUR helper, which runs in the terminal so you can review PKGBUILDs. sudo asks for the
+  password once, before the run starts.
+- Install no longer passes `--needed`, so an explicit install reinstalls.
+- `--yes`, pipes, and `--dry-run` skip the interface and use plain output. Native managers
+  then ask their own questions.
 - `--dry-run` prints the native commands without running them.
 - `--json` works with `search`, `detect`, and `install/remove --dry-run`.
-- With `--from`, a configured source name or a backend id is accepted (`native` means
-  the detected native manager).
+- `-v` prints each native query to stderr as it runs.
 
-Exit codes: `0` ok, `1` error, `2` ambiguous (non-interactive tie), `3` not found,
+Logs: `~/.local/state/uni/uni.log` (summary, one JSON object per line) and
+`~/.local/state/uni/transactions/<time>-<op>.log` (commands plus full output). `uni log` prints
+the summary.
+
+Exit codes: `0` ok, `1` error or cancelled, `2` ambiguous (non-interactive tie), `3` not found,
 `4` refused (fork not confirmed, unsafe command).
 
 ## Configuration

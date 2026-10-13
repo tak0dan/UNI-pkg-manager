@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 class Intent:
     """One unified operation, produced by a syntax frontend."""
 
-    op: str  # install | remove | search | detect
+    op: str  # install | remove | search | detect | log
     terms: list[str] = field(default_factory=list)
     syntax: str = "uni"
     # Source to search exclusively: set by --from, or by the syntax in route mode.
@@ -18,6 +18,7 @@ class Intent:
     yes: bool = False
     dry_run: bool = False
     json_out: bool = False
+    count: int = 30  # for `log`
 
 
 @dataclass

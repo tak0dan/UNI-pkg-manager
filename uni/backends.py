@@ -11,8 +11,10 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .model import Candidate
@@ -22,23 +24,37 @@ AUR_RPC = "https://aur.archlinux.org/rpc/v5"
 
 @dataclass
 class Step:
-    """One native command to run, with whether it needs root."""
+    """One native command to run.
+
+    root: needs privilege escalation.
+    interactive: the helper prompts or reviews on its own, so it runs with the
+    terminal handed over rather than inside uni's log view.
+    """
 
     argv: list[str]
     root: bool = False
     label: str = ""
+    interactive: bool = False
+
+
+# Set by the CLI so every query is traced (argv, exit code, duration).
+TRACE: Callable[[list[str], int, float], None] | None = None
 
 
 def run(argv: list[str], timeout: int = 60) -> tuple[int, str]:
     """Run a query command with C locale so parsing is predictable."""
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout, env=env, check=False
         )
+        rc, out = proc.returncode, proc.stdout
     except (OSError, subprocess.TimeoutExpired):
-        return 127, ""
-    return proc.returncode, proc.stdout
+        rc, out = 127, ""
+    if TRACE is not None:
+        TRACE(argv, rc, time.monotonic() - started)
+    return rc, out
 
 
 def _fields(text: str) -> dict[str, str]:
@@ -118,7 +134,7 @@ class PacmanBackend(Backend):
 
     def install(self, cands, yes):
         refs = [c.ref for c in cands]
-        return [Step(["pacman", "-S", "--needed", *_yes("--noconfirm", yes), *refs], True)]
+        return [Step(["pacman", "-S", *_yes("--noconfirm", yes), *refs], True)]
 
     def remove(self, cands, yes):
         refs = [c.ref for c in cands]
@@ -159,7 +175,8 @@ class AurBackend(Backend):
 
     def install(self, cands, yes):
         refs = [c.ref for c in cands]
-        return [Step([self.binary, "-S", "--needed", *_yes("--noconfirm", yes), *refs])]
+        # The helper reviews PKGBUILDs and asks questions, so it always runs interactively.
+        return [Step([self.binary, "-S", *refs], interactive=True)]
 
     def remove(self, cands, yes):
         # AUR packages are ordinary pacman packages once installed.

@@ -55,6 +55,7 @@ class Resolution:
     tie: bool = False
     replacement: str | None = None  # set when the request is a fork of another project
     notes: list[str] = field(default_factory=list)
+    hints: list[Candidate] = field(default_factory=list)  # matches in disabled sources
     error: str | None = None
     code: int = 0
 
@@ -95,6 +96,9 @@ class Context:
         pin = self.cfg["pins"].get(term)
         return self.concrete(pin) if pin else None
 
+    def available_ids(self) -> list[str]:
+        return sorted(self.backends, key=lambda s: (self.enabled(s) is False, self.priority(s)))
+
     def names_for(self, lookup: str, sources: list[str]) -> dict[str, list[str]]:
         names: dict[str, list[str]] = {sid: [] for sid in sources}
 
@@ -110,6 +114,19 @@ class Context:
         for sid in sources:
             add(sid, lookup)
         return names
+
+
+def _lookup(lookup: str, ctx: Context, sources: list[str]) -> list[Candidate]:
+    names = ctx.names_for(lookup, sources)
+    cands: list[Candidate] = []
+    seen: set[tuple[str, str]] = set()
+    for sid in sources:
+        for name in names.get(sid, []):
+            for cand in ctx.backends[sid].query(name):
+                if (cand.source, cand.ref) not in seen:
+                    seen.add((cand.source, cand.ref))
+                    cands.append(cand)
+    return cands
 
 
 def resolve(term: str, ctx: Context, source: str | None = None, installed_only: bool = False) -> Resolution:
@@ -138,21 +155,17 @@ def resolve(term: str, ctx: Context, source: str | None = None, installed_only: 
             res.code = 1
             return res
 
-    names = ctx.names_for(lookup, sources)
-    cands: list[Candidate] = []
-    seen: set[tuple[str, str]] = set()
-    for sid in sources:
-        for name in names.get(sid, []):
-            for cand in ctx.backends[sid].query(name):
-                key = (cand.source, cand.ref)
-                if key not in seen:
-                    seen.add(key)
-                    cands.append(cand)
+    cands = _lookup(lookup, ctx, sources)
     res.notes.extend(ctx.repology.warnings)
     ctx.repology.warnings.clear()
 
     if installed_only:
         cands = [c for c in cands if ctx.backends[c.source].installed(c.ref)]
+
+    if source is None and not installed_only:
+        # Show where else the name exists, so a disabled source (AUR, snap) is discoverable.
+        off = [sid for sid in ctx.available_ids() if not ctx.enabled(sid)]
+        res.hints = _lookup(lookup, ctx, off) if off else []
 
     if not cands:
         where = source or ", ".join(sources)
@@ -163,9 +176,11 @@ def resolve(term: str, ctx: Context, source: str | None = None, installed_only: 
 
     pin = ctx.pin_for(term)
 
-    def rank(c: Candidate) -> tuple[int, int]:
+    def rank(c: Candidate) -> tuple[int, int, int]:
         pinned_first = 0 if (pin and c.source == pin) else 1
-        return (pinned_first, ctx.priority(c.source))
+        # The exact name you typed wins over same-project siblings (steam over steam-devices).
+        exact = 0 if c.ref == lookup else 1
+        return (pinned_first, ctx.priority(c.source), exact)
 
     res.ranked = sorted(cands, key=rank)
     top = rank(res.ranked[0])
@@ -176,17 +191,20 @@ def resolve(term: str, ctx: Context, source: str | None = None, installed_only: 
 
 
 def search(term: str, ctx: Context, source: str | None = None) -> list[Candidate]:
-    """Raw search across sources, ordered by priority then name similarity."""
+    """Raw search across every available source, enabled or not.
+
+    Enabled sources sort by priority; disabled ones come after, so they are
+    visible without ever being chosen automatically.
+    """
     from rapidfuzz import fuzz
 
-    sources = [source] if source else ctx.enabled_ids()
+    sources = [source] if source else ctx.available_ids()
     found: list[Candidate] = []
     for sid in sources:
-        if sid in ctx.backends:
-            found.extend(ctx.backends[sid].search(term))
+        found.extend(ctx.backends[sid].search(term))
 
     def key(c: Candidate):
-        prio = ctx.priority(c.source) if source is None else 0
-        return (prio, -fuzz.WRatio(term, c.ref), c.ref)
+        on = ctx.enabled(c.source)
+        return (0 if on else 1, ctx.priority(c.source), -fuzz.WRatio(term, c.ref), c.ref)
 
     return sorted(found, key=key)

@@ -7,10 +7,7 @@ name = "uni-pkg"
 version = "0.1.0"
 description = "Unified wrapper for native package managers, with a name resolver and source hierarchy."
 requires-python = ">=3.11"
-dependencies = ["rapidfuzz>=3"]
-
-[project.optional-dependencies]
-tui = ["textual>=0.80"]
+dependencies = ["rapidfuzz>=3", "textual>=8", "rich>=13"]
 
 [project.scripts]
 uni = "uni.cli:main"

@@ -11,6 +11,10 @@ aur = ["discord-git"]
 dnf = ["discord"]
 flatpak = ["com.discordapp.Discord"]
 
+[packages.steam]
+pacman = ["steam"]
+flatpak = ["com.valvesoftware.Steam"]
+
 [relations.swww]
 to = "awww"
 kind = "fork"

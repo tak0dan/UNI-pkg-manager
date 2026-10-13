@@ -15,6 +15,9 @@ from .model import Intent, Passthrough
 
 ParseResult = Intent | Passthrough
 
+# Every source that can be named with --<source> as shorthand for --from <source>.
+SOURCE_FLAGS = ("native", "pacman", "apt", "dnf", "zypper", "flatpak", "snap", "aur")
+
 
 @dataclass
 class ParseCtx:
@@ -52,6 +55,8 @@ def _scan(args, ctx, yes_flags, dry_flags, ignored=()):
             continue
         if a.startswith("--from=") and a.partition("=")[2] in ctx.known_sources:
             opts["source"] = a.partition("=")[2]
+        elif a.startswith("--") and a[2:] in SOURCE_FLAGS and a[2:] in ctx.known_sources:
+            opts["source"] = a[2:]  # --flatpak is shorthand for --from flatpak
         elif a in yes_flags:
             opts["yes"] = True
         elif a in dry_flags or a == "--dry-run":
@@ -132,6 +137,9 @@ def _uni_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--from", dest="source", metavar="SOURCE",
                         help="search only this source, ignoring priorities (no fallback)")
+    for name in SOURCE_FLAGS:
+        common.add_argument(f"--{name}", dest="source", action="store_const", const=name,
+                            help=f"same as --from {name}")
     common.add_argument("-y", "--yes", action="store_true",
                         help="never prompt; ties and replacements fail instead of asking")
     common.add_argument("--accept-replacement", action="store_true",
@@ -143,19 +151,25 @@ def _uni_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="uni", description="Unified package manager wrapper.")
     parser.add_argument("--as", dest="as_syntax", metavar="SYNTAX", help="read commands in this syntax")
     parser.add_argument("--config", metavar="PATH", help="config file (default ~/.config/uni/config.toml)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="print every native query to stderr")
     sub = parser.add_subparsers(dest="op", required=True)
     for op in ("install", "remove", "search"):
         sp = sub.add_parser(op, parents=[common])
         sp.add_argument("terms", nargs="+", metavar="PACKAGE")
     sub.add_parser("detect", parents=[common], help="show the detected host and sources")
+    log = sub.add_parser("log", help="show recent uni activity")
+    log.add_argument("-n", type=int, default=30, help="number of entries (default 30)")
     return parser
 
 
 def _parse_uni(args: list[str], ctx: ParseCtx) -> ParseResult:
     ns = _uni_parser().parse_args(args)
-    return Intent(op=ns.op, terms=getattr(ns, "terms", []), syntax="uni", source=ns.source,
-                  accept_replacement=ns.accept_replacement, yes=ns.yes, dry_run=ns.dry_run,
-                  json_out=ns.json_out)
+    # `log` and `detect` have fewer options; getattr keeps the Intent defaults for those.
+    return Intent(op=ns.op, terms=getattr(ns, "terms", []), syntax="uni",
+                  source=getattr(ns, "source", None),
+                  accept_replacement=getattr(ns, "accept_replacement", False),
+                  yes=getattr(ns, "yes", False), dry_run=getattr(ns, "dry_run", False),
+                  json_out=getattr(ns, "json_out", False), count=getattr(ns, "n", 30))
 
 
 FRONTENDS: dict[str, Frontend] = {

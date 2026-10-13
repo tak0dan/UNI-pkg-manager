@@ -38,14 +38,16 @@ def repo_to_backend(repo: str) -> str | None:
 
 
 def _entries_from_api(payload: list[dict]) -> list[list[str]]:
+    """Flatten Repology packages to (backend, binary name) pairs, one per binary."""
     seen: set[tuple[str, str]] = set()
     out: list[list[str]] = []
     for pkg in payload:
         backend = repo_to_backend(pkg.get("repo", ""))
-        name = pkg.get("name") or pkg.get("visiblename")
-        if backend and name and (backend, name) not in seen:
-            seen.add((backend, name))
-            out.append([backend, name])
+        names = pkg.get("binnames") or [pkg.get("visiblename") or pkg.get("srcname")]
+        for name in names:
+            if backend and name and (backend, name) not in seen:
+                seen.add((backend, name))
+                out.append([backend, name])
     return out
 
 

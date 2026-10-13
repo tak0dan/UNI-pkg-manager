@@ -14,6 +14,7 @@ from unittest import mock
 from uni import backends, config, detect, frontends, repology, resolver
 from uni.backends import Backend, Step
 from uni.model import Candidate, Intent, Passthrough
+from uni.resolver import Resolution
 from uni.transaction import UnsafeCommand, check_safe, execute
 
 PARSE_CTX = frontends.ParseCtx(
@@ -134,11 +135,41 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(res.best.source, "flatpak")
 
     def test_same_priority_is_a_tie(self):
-        bs = {"pacman": FakeBackend("pacman", {"discord": [Candidate("pacman", "discord"),
-                                                           Candidate("pacman", "discord-git")]})}
+        bs = {"pacman": FakeBackend("pacman", {"discord": [Candidate("pacman", "discord-git"),
+                                                           Candidate("pacman", "discord-ptb")]})}
         res = resolver.resolve("discord", make_ctx(bs))
         self.assertTrue(res.tie)
         self.assertEqual(len(res.ranked), 2)
+
+    def test_exact_name_breaks_a_same_source_tie(self):
+        # steam must not tie with its same-project sibling steam-devices.
+        bs = {"pacman": FakeBackend("pacman", {"steam": [Candidate("pacman", "steam-devices"),
+                                                         Candidate("pacman", "steam")]})}
+        res = resolver.resolve("steam", make_ctx(bs))
+        self.assertFalse(res.tie)
+        self.assertEqual(res.best.ref, "steam")
+
+    def test_disabled_source_matches_are_hints_not_choices(self):
+        cfg_sources = copy.deepcopy(config.DEFAULTS["sources"])
+        bs = {
+            "pacman": FakeBackend("pacman", {}),
+            "aur": FakeBackend("aur", {"discord-git": [Candidate("aur", "discord-git")]}),
+        }
+        db = resolver.PackageDB(aliases={"discord": {"aur": ["discord-git"]}})
+        res = resolver.resolve("discord", make_ctx(bs, sources=cfg_sources, db=db))
+        self.assertIsNotNone(res.error)  # aur is disabled by default
+        self.assertEqual([h.describe() for h in res.hints], ["aur: discord-git"])
+        res = resolver.resolve("discord", make_ctx(bs, sources=cfg_sources, db=db), source="aur")
+        self.assertEqual(res.best.ref, "discord-git")
+
+    def test_search_lists_disabled_sources_last(self):
+        cfg_sources = copy.deepcopy(config.DEFAULTS["sources"])
+        bs = {
+            "pacman": FakeBackend("pacman", {"discord": [Candidate("pacman", "discord")]}),
+            "aur": FakeBackend("aur", {"discord-git": [Candidate("aur", "discord-git")]}),
+        }
+        found = resolver.search("discord", make_ctx(bs, sources=cfg_sources))
+        self.assertEqual([c.source for c in found], ["pacman", "aur"])
 
     def test_from_is_exclusive_and_does_not_fall_back(self):
         bs = {
@@ -310,8 +341,8 @@ class RepologyTests(unittest.TestCase):
 
         def fake_fetch(project):
             calls.append(project)
-            return [{"repo": "arch", "name": "discord"}, {"repo": "aur", "name": "discord-git"},
-                    {"repo": "gentoo", "name": "x"}]
+            return [{"repo": "arch", "binnames": ["discord"]}, {"repo": "aur", "binnames": ["discord-git"]},
+                    {"repo": "gentoo", "binnames": ["x"]}]
 
         with tempfile.TemporaryDirectory() as tmp:
             rep = repology.Repology(True, Path(tmp), 24, fetch=fake_fetch)
@@ -347,6 +378,20 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(config.ConfigError):
                 config.load(path)
 
+    def test_repology_binnames_are_all_kept(self):
+        def fetch(project):
+            return [{"repo": "alt_p11", "visiblename": "steam", "binnames": ["steam", "steam-devices"]}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = repology.Repology(True, Path(tmp), 24, fetch=fetch)
+            self.assertEqual(rep.names("steam"), [])  # alt is not a uni backend; nothing to keep
+        def fetch_arch(project):
+            return [{"repo": "arch", "binnames": ["steam", "steam-devices"]}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = repology.Repology(True, Path(tmp), 24, fetch=fetch_arch)
+            self.assertEqual(rep.names("steam"), [("pacman", "steam"), ("pacman", "steam-devices")])
+
     def test_bundled_alias_table_loads(self):
         db = resolver.PackageDB.load([resolver.DATA_PACKAGES])
         self.assertEqual(db.aliases["discord"]["flatpak"], ["com.discordapp.Discord"])
@@ -363,26 +408,126 @@ class LivePacmanTests(unittest.TestCase):
 
 
 class TuiTests(unittest.TestCase):
-    def test_picker_preselects_first_and_returns_it_on_enter(self):
-        try:
-            import textual  # noqa: F401
-        except ImportError:
-            self.skipTest("textual not installed")
+    """Drive the Textual app headlessly. Steps are harmless `echo` commands."""
+
+    def _plan(self, resolutions, accept=None):
+        from uni.tui import Plan
+
+        cfg = copy.deepcopy(config.DEFAULTS)
+        cfg["safety"]["snapper"] = False  # no snapshots or sudo in headless tests
+        return Plan(
+            title="install test", cfg=cfg, label="install test",
+            resolutions=resolutions,
+            accept=accept or [False] * len(resolutions),
+            build=lambda chosen: [Step(["echo", c.ref]) for c in chosen],
+            notices=["Understood as: test"],
+        )
+
+    def _drive(self, plan, keys):
         import asyncio
 
         from uni import tui
 
-        cls = tui._app_class()
-        options = [(Candidate("pacman", "discord"), "pacman -S discord"),
-                   (Candidate("pacman", "discord-git"), "pacman -S discord-git")]
+        app = tui.make_app(plan)
 
-        async def drive():
-            app = cls("discord", options)
+        async def run():
             async with app.run_test() as pilot:
-                await pilot.press("enter")
-            return app.return_value
+                await pilot.pause()
+                for key in keys:
+                    await pilot.press(key)
+                    await pilot.pause()
+                for _ in range(100):
+                    if app.result is not None:
+                        break
+                    await pilot.pause(0.05)
+                await pilot.press("q") if app.result is not None else None
+                await pilot.pause()
+            return app
 
-        self.assertEqual(asyncio.run(drive()).ref, "discord")
+        return asyncio.run(run())
+
+    def _ranked(self, *refs):
+        cands = [Candidate("pacman", r) for r in refs]
+        return Resolution("pkg", ranked=cands, tie=len(cands) > 1)
+
+    def test_tie_picker_then_plan_then_run_succeeds(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+        plan = self._plan([self._ranked("discord-git", "discord-ptb")])
+        app = self._drive(plan, ["enter", "enter"])  # pick first row, run the plan
+        self.assertEqual(app.result, 0)
+
+    def test_escape_on_picker_cancels_with_status_1(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+        plan = self._plan([self._ranked("a", "b")])
+        app = self._drive(plan, ["escape"])
+        self.assertEqual(app.result, 1)
+
+    def test_no_tie_goes_straight_to_plan(self):
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            self.skipTest("textual not installed")
+        plan = self._plan([Resolution("pkg", ranked=[Candidate("pacman", "discord")])])
+        app = self._drive(plan, ["enter"])
+        self.assertEqual(app.result, 0)
+
+
+class LoggingTests(unittest.TestCase):
+    def test_transaction_record_contains_commands_and_output(self):
+        from uni import render
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+            path = render.write_transaction("install", "discord", ["sudo pacman -S discord"],
+                                            ["resolving dependencies...", "done"], 0)
+            text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("exit status: 0", text)
+        self.assertIn("$ sudo pacman -S discord", text)
+        self.assertIn("resolving dependencies...", text)
+
+    def test_log_entries_are_readable(self):
+        from uni import render
+
+        entry = {"ts": 0, "type": "transaction", "op": "install", "resolved": ["pacman: discord"], "rc": 0,
+                 "log": "/x/y.log"}
+        line = render.format_entry(entry)
+        self.assertIn("install pacman: discord rc=0", line)
+        self.assertIn("full output: /x/y.log", line)
+
+    def test_log_subcommand_parses(self):
+        p = frontends.parse("uni", ["log", "-n", "5"], PARSE_CTX)
+        self.assertEqual((p.op, p.count), ("log", 5))
+
+
+class CliGuessTests(unittest.TestCase):
+    def test_guess_syntax_from_first_word(self):
+        from uni import cli
+
+        self.assertEqual(cli._guess_syntax(["apt", "install", "x"]), ("apt", ["install", "x"]))
+        self.assertEqual(cli._guess_syntax(["-S", "steam"]), ("pacman", ["-S", "steam"]))
+        self.assertEqual(cli._guess_syntax(["-Syu"]), ("pacman", ["-Syu"]))
+        self.assertEqual(cli._guess_syntax(["install", "steam"]), (None, ["install", "steam"]))
+
+    def test_source_shorthand_flags(self):
+        ctx = frontends.ParseCtx(known_sources=frozenset({"flatpak", "aur", "native"}), remotes=lambda: set())
+        p = frontends.parse("uni", ["install", "steam", "--flatpak"], ctx)
+        self.assertEqual(p.source, "flatpak")
+        p = frontends.parse("apt", ["install", "steam", "--aur"], ctx)
+        self.assertEqual(p.source, "aur")
+
+    def test_install_does_not_use_needed(self):
+        step = backends.PacmanBackend().install([Candidate("pacman", "discord")], yes=False)[0]
+        self.assertEqual(step.argv, ["pacman", "-S", "discord"])
+
+    def test_aur_install_is_interactive(self):
+        step = backends.AurBackend({"helper": "paru"}).install([Candidate("aur", "x")], yes=True)[0]
+        self.assertTrue(step.interactive)
+        self.assertNotIn("--noconfirm", step.argv)
 
 
 if __name__ == "__main__":
