@@ -8,7 +8,7 @@ snap    = { enabled = false, priority = 3 }
 # AUR and snap are off by default: they are never picked automatically.
 # Their matches still appear as hints and in `uni search`.
 aur     = { enabled = false, priority = 4 }   # helper: "paru" or "yay"; default: first installed
-nix     = { enabled = false, priority = 5 }
+nix     = { enabled = false, priority = 5 }   # optional: channel = "nixos-25.05" (default nixpkgs-unstable)
 # Windows: winget is the native manager there. choco and scoop are off unless you enable them.
 choco   = { enabled = false, priority = 6 }
 scoop   = { enabled = false, priority = 6 }

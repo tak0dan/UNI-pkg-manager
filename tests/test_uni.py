@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from uni import backends, config, detect, frontends, repology, resolver
+from uni import backends, config, detect, frontends, nixindex, repology, resolver
 from uni.backends import Backend, Step
 from uni.model import Candidate, Intent, Invalid, Passthrough
 from uni.resolver import Resolution
@@ -315,6 +315,58 @@ class BackendParsingTests(unittest.TestCase):
             [c] = backends.AurBackend({"helper": "paru"}).query("discord-git")
         self.assertEqual((c.source, c.ref), ("aur", "discord-git"))
 
+
+
+class NixIndexTests(unittest.TestCase):
+    PACKAGES = {
+        "version": 2,
+        "packages": {
+            "steam": {"pname": "steam", "version": "1.0.0.87",
+                      "meta": {"description": "Digital distribution platform",
+                               "license": {"free": False, "shortName": "unfreeRedistributable"}}},
+            "steam-run": {"pname": "steam-run", "version": "1.0", "meta": {"description": "run things"}},
+            "hello": {"pname": "hello", "version": "2.12", "meta": {"description": "says hi",
+                                                                     "license": [{"free": True}]}},
+        },
+    }
+
+    def index(self, tmp, fetch=None):
+        blob = json.dumps(self.PACKAGES, indent=1).encode()
+        return nixindex.NixIndex(Path(tmp), fetch=fetch or (lambda: blob))
+
+    def test_stream_parser_survives_any_chunk_boundary(self):
+        text = json.dumps(self.PACKAGES, indent=1)
+        for size in (1, 7, 64, len(text)):
+            chunks = (text[i:i + size] for i in range(0, len(text), size))
+            self.assertEqual([k for k, _ in nixindex.iter_packages(chunks)], ["steam", "steam-run", "hello"])
+
+    def test_unfree_package_is_found_and_installed_impure(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(nixindex, "_decompressed_chunks", side_effect=lambda b: iter([b.decode()])):
+            b = backends.NixBackend(index=self.index(tmp))
+            [steam] = b.query("steam")
+            self.assertEqual(steam.version, "1.0.0.87")
+            self.assertEqual([c.ref for c in b.search("steam")], ["steam", "steam-run"])
+            [unfree, free] = b.install([steam, *b.query("hello")], yes=True)
+        self.assertEqual(unfree.argv[:2], ["env", "NIXPKGS_ALLOW_UNFREE=1"])
+        self.assertIn("--impure", unfree.argv)
+        self.assertEqual(free.argv[0], "nix")
+
+    def test_unreachable_index_is_an_error_not_an_empty_result(self):
+        def offline():
+            raise nixindex.NixIndexError("could not download")
+        with tempfile.TemporaryDirectory() as tmp:
+            b = backends.NixBackend(index=self.index(tmp, fetch=offline))
+            with self.assertRaises(backends.BackendError):
+                b.query("steam")
+
+    def test_stale_index_is_used_when_refresh_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(nixindex, "_decompressed_chunks", side_effect=lambda b: iter([b.decode()])):
+            self.index(tmp).build()
+            stale = self.index(tmp, fetch=mock.Mock(side_effect=nixindex.NixIndexError("offline")))
+            stale.ttl = 0
+            self.assertIsNotNone(stale.get("steam"))
 
 class DetectTests(unittest.TestCase):
     def test_family_mapping(self):

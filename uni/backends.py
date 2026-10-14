@@ -421,10 +421,12 @@ NIX_FLAGS = ["--extra-experimental-features", "nix-command flakes"]
 
 
 class NixBackend(Backend):
-    """Nix: imperative profile operations through `nix profile` and `nix search`.
+    """Nix: imperative profile operations through `nix profile`.
 
-    Packages are addressed as nixpkgs#<attribute>. Needs flakes enabled, which the
-    commands request explicitly. Not yet tested against a live Nix installation.
+    Packages are addressed as nixpkgs#<attribute>. Lookups use the channel's published
+    metadata (see nixindex.py) rather than `nix search`, which needs the daemon and a full
+    evaluation and fails silently when either is missing. Unfree packages are installed
+    with NIXPKGS_ALLOW_UNFREE=1 --impure, as `nix profile` refuses them otherwise.
     """
 
     id = "nix"
@@ -432,33 +434,52 @@ class NixBackend(Backend):
     native = False
     needs_root = False
 
-    def _rows(self, term: str) -> list[Candidate]:
-        rc, out = run(["nix", *NIX_FLAGS, "search", "--json", "nixpkgs", term])
-        if rc or not out.strip():
-            return []
+    def __init__(self, options=None, index=None):
+        super().__init__(options)
+        self._index = index
+
+    @property
+    def index(self):
+        if self._index is None:
+            from .config import cache_dir
+            from .nixindex import DEFAULT_CHANNEL, NixIndex
+
+            self._index = NixIndex(cache_dir() / "nix", self.options.get("channel", DEFAULT_CHANNEL),
+                                   self.options.get("cache_hours", 24))
+        return self._index
+
+    def _cands(self, rows) -> list[Candidate]:
+        return [Candidate(self.id, attr, version, desc + (" [unfree]" if unfree else ""))
+                for attr, _pname, version, desc, unfree in rows]
+
+    def _lookup(self, fn, arg):
+        from .nixindex import NixIndexError
+
         try:
-            data = json.loads(out)
-        except ValueError:
-            raise BackendError(self.id, "could not read `nix search` output")
-        results = []
-        for key, info in data.items():
-            # keys look like legacyPackages.x86_64-linux.<attribute>
-            attr = key.split(".", 2)[2] if key.count(".") >= 2 else key
-            results.append(Candidate(self.id, attr, info.get("version", ""), info.get("description", "")))
-        return results
+            return fn(arg)
+        except NixIndexError as exc:
+            raise BackendError(self.id, str(exc)) from exc
 
     def query(self, name):
-        return [c for c in self._rows(name) if c.ref == name]
+        row = self._lookup(self.index.get, name)
+        return self._cands([row]) if row else []
 
     def search(self, term):
-        return self._rows(term)
+        return self._cands(self._lookup(self.index.search, term))
 
     def installed(self, ref):
         rc, out = run(["nix", *NIX_FLAGS, "profile", "list"])
         return rc == 0 and any(ref in line.split() for line in out.splitlines())
 
     def install(self, cands, yes):
-        return [Step(["nix", *NIX_FLAGS, "profile", "install", f"nixpkgs#{c.ref}"]) for c in cands]
+        steps = []
+        for c in cands:
+            argv = ["nix", *NIX_FLAGS, "profile", "install", f"nixpkgs#{c.ref}"]
+            row = self._lookup(self.index.get, c.ref)
+            if row and row[4]:  # unfree
+                argv = ["env", "NIXPKGS_ALLOW_UNFREE=1", *argv, "--impure"]
+            steps.append(Step(argv))
+        return steps
 
     def remove(self, cands, yes, flags=frozenset()):
         return [Step(["nix", *NIX_FLAGS, "profile", "remove", c.ref]) for c in cands]
